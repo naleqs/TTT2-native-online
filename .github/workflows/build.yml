@@ -1,0 +1,54 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Portable toolchain (same as Setup.bat)
+        shell: pwsh
+        run: |
+          $tc = Get-Content config/toolchain.json -Raw | ConvertFrom-Json
+          foreach ($t in $tc.tools | Where-Object { $_.name -in 'llvm-mingw','ninja' }) {
+            $zip = "$env:RUNNER_TEMP\$($t.name).zip"
+            Invoke-WebRequest $t.url -OutFile $zip
+            if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $t.sha256.ToUpper()) { throw "bad hash: $($t.name)" }
+            Expand-Archive $zip "$env:RUNNER_TEMP\$($t.name)"
+            $dir = Get-ChildItem "$env:RUNNER_TEMP\$($t.name)" | Select-Object -First 1
+            $bin = if ($dir.PSIsContainer -and (Test-Path "$($dir.FullName)\bin")) { "$($dir.FullName)\bin" } else { "$env:RUNNER_TEMP\$($t.name)" }
+            Add-Content $env:GITHUB_PATH $bin
+          }
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build launcher, netplay and tests
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Package
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $out = "TTT2-native-online-$($env:GITHUB_REF_NAME)"
+          New-Item -ItemType Directory $out | Out-Null
+          Copy-Item "build\bin\TTT2 Native Online.exe" $out
+          foreach ($p in 'Setup.bat','tools','config','src','cmake','tests','CMakeLists.txt','VERSION','LICENSE','README.md','CREDITS.md','.env.example','iso','docs') {
+            Copy-Item $p $out -Recurse
+          }
+          Compress-Archive $out "$out.zip"
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: TTT2-native-online-*.zip

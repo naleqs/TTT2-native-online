@@ -1,0 +1,20 @@
+diff --git a/XenonUtils/xex.cpp b/XenonUtils/xex.cpp
+index 4e79042..5b61400 100644
+--- a/XenonUtils/xex.cpp
++++ b/XenonUtils/xex.cpp
+@@ -257,6 +257,15 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize)
+         }
+     }
+ 
++    // Basic compression only covers the blocks it stores; the rest of the image (zero-
++    // initialised data at the end) must exist and be zero, not be read out of bounds.
++    if (imageSize < security->imageSize)
++    {
++        auto full = std::make_unique<uint8_t[]>(security->imageSize);
++        memcpy(full.get(), result.get(), imageSize);
++        result = std::move(full);
++    }
++
+     image.data = std::move(result);
+     image.size = security->imageSize;
+ 

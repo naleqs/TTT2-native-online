@@ -1,0 +1,33 @@
+{
+  "_comment": "Portable build tools downloaded by setup into native\\toolchain. Pinned and SHA-256 checked. Nothing is installed system-wide.",
+  "tools": [
+    {
+      "name": "llvm-mingw",
+      "url": "https://github.com/mstorsjo/llvm-mingw/releases/download/20240619/llvm-mingw-20240619-ucrt-x86_64.zip",
+      "sha256": "810703594a7e3eea03385b5329c7ea3bd65f5e496b44cf1b68c17ff436d265e7",
+      "bin": "bin",
+      "license": "Apache-2.0 WITH LLVM-exception (LLVM), mingw-w64 runtime licenses"
+    },
+    {
+      "name": "cmake",
+      "url": "https://github.com/Kitware/CMake/releases/download/v3.30.5/cmake-3.30.5-windows-x86_64.zip",
+      "sha256": "5ab6e1faf20256ee4f04886597e8b6c3b1bd1297b58a68a58511af013710004b",
+      "bin": "bin",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "ninja",
+      "url": "https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-win.zip",
+      "sha256": "f550fec705b6d6ff58f2db3c374c2277a37691678d6aba463adcbb129108467a",
+      "bin": ".",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "git",
+      "url": "https://github.com/git-for-windows/git/releases/download/v2.47.0.windows.1/MinGit-2.47.0-64-bit.zip",
+      "sha256": "6b175d4675bfa7014ba649e3c0976da2a281d89bd9a096f1f41437f9995497a8",
+      "bin": "cmd",
+      "license": "GPL-2.0 (Git for Windows)"
+    }
+  ]
+}

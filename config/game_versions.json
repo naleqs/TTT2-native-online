@@ -1,0 +1,203 @@
+{
+  "_comment": "Accepted copies of the game. Hashes only - no game data is distributed with this project.",
+  "versions": [
+    {
+      "id": "ttt2-x360-usa-eur",
+      "name": "Tekken Tag Tournament 2 (USA, Europe)",
+      "title_id": "54656B6B",
+      "image": {
+        "layout": "XGD3",
+        "size": 8738846720,
+        "sha1": "cf9dcfb9f88d5f7d2e69f1bab6eb5856b411136f",
+        "_note": "Redump-verified dump. A matching image skips the per-file check."
+      },
+      "default_xex_sha1": "a942090b7c293d0ce63346ed8a2974448135d0dd",
+      "files": {
+        "AvatarAssetPack": {
+          "sha1": "214db560de3422182284ed5c82a3f94e55936ebc",
+          "size": 13799424
+        },
+        "Default.xex": {
+          "sha1": "a942090b7c293d0ce63346ed8a2974448135d0dd",
+          "size": 15941632
+        },
+        "data000.bin": {
+          "sha1": "ec772813f3886b2b79179fd2aed7bacfedc0cfd8",
+          "size": 4064970
+        },
+        "data001.bin": {
+          "sha1": "fd1f42e73b0e06071ec20c695841cdefbcada49e",
+          "size": 385691766
+        },
+        "data002.bin": {
+          "sha1": "4340d2eaa23af6fa3657e7d92eb68614e8f1ab91",
+          "size": 38587710
+        },
+        "data003.bin": {
+          "sha1": "0bae33f9f3950540e62ebcae856bd7eb221fb5c4",
+          "size": 75648926
+        },
+        "data004.bin": {
+          "sha1": "b3f6930098d446ab1eced9518993fcbf78be3732",
+          "size": 4075114
+        },
+        "data005.bin": {
+          "sha1": "2fabe7cb1dda6bdf08b47eb80721da13a7f21b1e",
+          "size": 170814504
+        },
+        "data006.bin": {
+          "sha1": "6232e9d82988eb8c124e443d0d840048acd4827e",
+          "size": 20354904
+        },
+        "data007.bin": {
+          "sha1": "601340422fb21d087bed887a1175c2642ad24e51",
+          "size": 91576894
+        },
+        "data008.bin": {
+          "sha1": "556445dd6b129dbe253169f17b91b88910b8ed3e",
+          "size": 129855846
+        },
+        "data009.bin": {
+          "sha1": "ccdbf16de0df753bc8d5dc6de125dea88865aa0d",
+          "size": 206359646
+        },
+        "data010.bin": {
+          "sha1": "53dc33cf4202877768e57f7be92154b40b2dbc8a",
+          "size": 199306610
+        },
+        "data011.bin": {
+          "sha1": "a4364c4aeed05977e47c49a1dd11f8c5487fcc8c",
+          "size": 227421262
+        },
+        "data012.bin": {
+          "sha1": "3f01ed57550a8a8cf943605fe302ebb8553521b3",
+          "size": 175345986
+        },
+        "data013.bin": {
+          "sha1": "69d1a135d2282d94578fd76053589a52c2d16f70",
+          "size": 215050692
+        },
+        "data014.bin": {
+          "sha1": "71dcaf15e0064684cc86ce35e0fa114861259557",
+          "size": 173896704
+        },
+        "data015.bin": {
+          "sha1": "192b16dcfb6742a172cd50dd744cd6b672f24a87",
+          "size": 158247204
+        },
+        "data016.bin": {
+          "sha1": "e052d5cc4e29c0b35630a5ff671ed4d3f7ef5129",
+          "size": 56362068
+        },
+        "data017.bin": {
+          "sha1": "c14764e83e58a3c2040acbf1f3f41f10aac1e41f",
+          "size": 356418750
+        },
+        "data018.bin": {
+          "sha1": "47b3741442a292a99675e0f1c5e5305b96efefc2",
+          "size": 557332
+        },
+        "data019.bin": {
+          "sha1": "3f7a6fc6480658b8d617728d0874559db8670a01",
+          "size": 31624
+        },
+        "data025.bin": {
+          "sha1": "1a762962f4ab3364da6ed039e3cc404da3dd57c4",
+          "size": 189334638
+        },
+        "data026.bin": {
+          "sha1": "f227558c3674d98b0a10be1a0fd4578837176a7f",
+          "size": 256
+        },
+        "data027.bin": {
+          "sha1": "138fb1eb02091766f281918a617e896348055990",
+          "size": 613117984
+        },
+        "data028.bin": {
+          "sha1": "cc16cb31434256bfef72d959c55e6edc3a7a1109",
+          "size": 102209010
+        },
+        "data034.bin": {
+          "sha1": "e6e5f324b8fe1bad53a0f6e4473a5b09bf8775fd",
+          "size": 199287232
+        },
+        "data035.bin": {
+          "sha1": "972cea7cb4f891e9433cd593dc9ba70655f60501",
+          "size": 250237456
+        },
+        "data036.bin": {
+          "sha1": "845237434bc9eac37c3ae453e234e57c1ae23b7c",
+          "size": 379630736
+        },
+        "data037.bin": {
+          "sha1": "ebfdc3af26051b492040cbd709b0b2d5c8bffa60",
+          "size": 305710000
+        },
+        "data038.bin": {
+          "sha1": "54ce35754cbcd68520396ce481fa847299823e43",
+          "size": 306422144
+        },
+        "data039.bin": {
+          "sha1": "cfc487b0263f28774f235737e3ebae66e4cf2994",
+          "size": 464935296
+        },
+        "data040.bin": {
+          "sha1": "e3e2947282f4b0f29cc014c01cad0e33584946a4",
+          "size": 255621792
+        },
+        "data041.bin": {
+          "sha1": "b1d6e2b7e826a6ebd94b9a4d09711ea9834f61c2",
+          "size": 436231024
+        },
+        "data042.bin": {
+          "sha1": "c9ce1552752936dc0f6afd5a16facdb8913b1699",
+          "size": 326598144
+        },
+        "data043.bin": {
+          "sha1": "91ea9cac71b925c69738e76026a7e6b5640e7294",
+          "size": 302789856
+        },
+        "data044.bin": {
+          "sha1": "55137269b05c974b77ee19a7041cdd6157268938",
+          "size": 437646976
+        },
+        "data045.bin": {
+          "sha1": "d0201986d968ad5efd75de30c2a9f7903f218204",
+          "size": 300581968
+        },
+        "data046.bin": {
+          "sha1": "7b8611cdd59b765244fc7dc5227ad0c8dbdf1ac3",
+          "size": 222882496
+        },
+        "data047.bin": {
+          "sha1": "fc61ae29b6fb90391a9a928b3f082da0b0da7d0d",
+          "size": 429342832
+        },
+        "data050.bin": {
+          "sha1": "44a1063908ab4fba13fd96d27e10404fb8278f81",
+          "size": 3683036
+        },
+        "data051.bin": {
+          "sha1": "a8dd93ac4dcc88f80f9979af0dfa33ac4432f426",
+          "size": 51581392
+        },
+        "data052.bin": {
+          "sha1": "b03139fa8f0f73cd69aaf571470a859bc453e34a",
+          "size": 2659880
+        },
+        "data053.bin": {
+          "sha1": "a7d19c101c6c83a3817b96c37fd4ea8c0d20f545",
+          "size": 412736
+        },
+        "nrfo.bin": {
+          "sha1": "101c4696ef83f8a1bf7ce78ae89f8f3a3cad72ac",
+          "size": 298696
+        },
+        "nxeart": {
+          "sha1": "73cdd8750b63a4425011b43a2f59337f3c9db24f",
+          "size": 2306048
+        }
+      }
+    }
+  ]
+}

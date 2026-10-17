@@ -1,0 +1,76 @@
+# ------------------------------------------------------------------
+# Game data: NEVER commit anything from the player's own copy.
+# ------------------------------------------------------------------
+*.iso
+*.xex
+*.xexp
+*.god
+*.bin
+*.xcp
+*.stfs
+iso/*
+!iso/README.txt
+
+# Everything the first-time setup creates (extracted disc, recompiled
+# code, compiled game, downloaded toolchain, logs)
+native/
+
+# Generated recompiler output and analysis (derived from the game binary)
+ppc/
+tt2_recomp.toml
+tt2_switch_tables.toml
+tt2_analysis.json
+
+# ------------------------------------------------------------------
+# Local configuration / secrets
+# ------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+config/*.local.json
+profile.json
+netplay.local.json
+
+# ------------------------------------------------------------------
+# Build output
+# ------------------------------------------------------------------
+build/
+build-*/
+out/
+dist/
+_deps/
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+compile_commands.json
+*.obj
+*.o
+*.a
+*.lib
+*.pdb
+*.ilk
+*.exp
+*.exe
+*.dll
+*.pch
+
+# ------------------------------------------------------------------
+# Logs, crash dumps, netplay diagnostics
+# ------------------------------------------------------------------
+*.log
+*.dmp
+logs/
+rollback_log/
+
+# ------------------------------------------------------------------
+# Editors / OS
+# ------------------------------------------------------------------
+.vs/
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.user
+*.suo
+.DS_Store
+Thumbs.db
+desktop.ini

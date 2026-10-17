@@ -1,0 +1,23 @@
+# Hand-maintained additions to the generated recompiler config. setup.ps1 appends this file
+# to native/build/recomp/tt2_recomp.toml after tt2-analyze has written the generated part.
+#
+# Mid-asm hooks call into the runtime at fixed instructions of the game. They are what the
+# rollback netcode needs from the game (see docs/NETPLAY.md):
+#
+#   * Tt2FrameBoundary  - top of the main loop, once per game frame. Rollback saves/loads
+#                         state and re-simulates frames here (Tekken6-rollback hooks the
+#                         same point of Tekken 6).
+#   * Tt2FightStart     - the fight scene became active (rollback is only enabled in fights).
+#   * Tt2FightEnd       - KO / result screen reached.
+#
+# The addresses are not known yet; finding them is the next reverse-engineering step and
+# is tracked in docs/STATUS.md. Until then the runtime falls back to treating the first
+# XamInputGetState call of each frame as the frame boundary, like Tekken6-rollback's pad
+# read hook.
+#
+# Example (address is a placeholder - do not enable as is):
+#
+# [[midasm_hook]]
+# name = "Tt2FrameBoundary"
+# address = 0x00000000
+# registers = ["r3"]
