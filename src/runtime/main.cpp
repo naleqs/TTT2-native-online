@@ -24,12 +24,14 @@
 #endif
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -43,11 +45,40 @@ namespace tt2
     }
 
     bool g_trace_imports = false;
+    namespace
+    {
+        std::vector<std::string> g_trace_filter; // empty = every import
+        bool g_trace_stack = false;
+    }
+
+    // The game's code saves return addresses on the guest stack as on the console
+    // (stw r12,-8(r1) before stwu r1,-N(r1)), so the back chain gives a guest backtrace.
+    std::string guest_backtrace(uint32_t r1, int depth)
+    {
+        std::string out;
+        for (int i = 0; i < depth; i++)
+        {
+            if (r1 < 0x40000000 || r1 >= 0x7F000000)
+                break;
+            const uint32_t caller = load32(r1);
+            if (caller <= r1 || caller >= 0x7F000000)
+                break;
+            const uint32_t lr = load32(caller - 8);
+            char buf[16];
+            snprintf(buf, sizeof(buf), " %08X", lr);
+            out += buf;
+            r1 = caller;
+        }
+        return out;
+    }
 
     void trace_import(const char* name, const PPCContext& ctx)
     {
+        if (!g_trace_filter.empty() && std::find(g_trace_filter.begin(), g_trace_filter.end(), name) == g_trace_filter.end())
+            return;
         const auto t = kernel::current_thread();
-        log("[t%u] %s(%08X, %08X, %08X, %08X) lr=%08llX", t ? t->id : 0, name, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, (unsigned long long)ctx.lr);
+        log("[t%u] %s(%08X, %08X, %08X, %08X) lr=%08llX%s%s", t ? t->id : 0, name, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
+            (unsigned long long)ctx.lr, g_trace_stack ? " stack:" : "", g_trace_stack ? guest_backtrace(ctx.r1.u32, 12).c_str() : "");
     }
 
     namespace
@@ -184,8 +215,29 @@ namespace
 int main(int argc, char** argv)
 {
     const CommandLine cmd = parse(argc, argv);
-    if (const char* t = std::getenv("TT2_TRACE"); t && *t == '1')
+    // TT2_TRACE=1 logs every import; TT2_TRACE=Name1,Name2 only those. TT2_TRACE_STACK=1 adds
+    // a guest backtrace to each line.
+    if (const char* t = std::getenv("TT2_TRACE"); t && *t)
+    {
         g_trace_imports = true;
+        if (std::string(t) != "1")
+        {
+            std::string list = t;
+            size_t start = 0;
+            while (start <= list.size())
+            {
+                const size_t comma = list.find(',', start);
+                const std::string item = list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                if (!item.empty())
+                    g_trace_filter.push_back(item);
+                if (comma == std::string::npos)
+                    break;
+                start = comma + 1;
+            }
+        }
+    }
+    if (const char* s = std::getenv("TT2_TRACE_STACK"); s && *s == '1')
+        g_trace_stack = true;
     const fs::path bin = exe_dir();
     const fs::path native = bin.parent_path();
 
