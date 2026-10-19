@@ -11,6 +11,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <chrono>
 #include <thread>
 #include <mutex>
 #include <iterator>
@@ -426,14 +427,41 @@ BlitOut vs_blit(uint id : SV_VertexID)
 Texture2D blit_tex : register(t0);
 SamplerState blit_smp : register(s0);
 float4 ps_blit(BlitOut i) : SV_Target { return float4(blit_tex.Sample(blit_smp, i.uv).rgb, 1.0f); }
-// Depth resolve: the depth value at the same pixel (the viewport is the destination's size).
+// Resolves drawn as a pass: destination pixel -> source sample (pixel * samples per pixel).
+cbuffer CopyConsts : register(b3) { uint4 copy_scale; };
 Texture2D<float> depth_src : register(t0);
-float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(i.pos.xy, 0)); }
+float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(uint2(i.pos.xy) * copy_scale.xy, 0)); }
+// Colour resolve from a multisampled (sample-resolution) surface: sample 0 of each pixel.
+Texture2D color_src : register(t0);
+float4 ps_color_copy(BlitOut i) : SV_Target { return color_src.Load(int3(uint2(i.pos.xy) * copy_scale.xy, 0)); }
+// FPS overlay: up to 8 characters of a 3x5 font (4 bits each in text.x, count in text.y) in a
+// dark box at pixel text.zw, text_scale.x pixels per font cell.
+cbuffer TextConsts : register(b4) { uint4 text; uint4 text_scale; };
+static const uint kGlyphs[14] = { 31599, 11415, 29671, 29647, 23497, 31183, 31215, 29257, 31727, 31695,
+                                  31140, 31716, 31183, 0 }; // 0-9 F P S space
+float4 ps_text(BlitOut i) : SV_Target
+{
+    const int2 cell = (int2(i.pos.xy) - int2(text.zw)) / int(text_scale.x) - 1;
+    const int ch = cell.x / 4, col = cell.x % 4;
+    if (cell.x >= 0 && cell.y >= 0 && cell.y < 5 && col < 3 && ch < int(text.y))
+    {
+        const uint glyph = kGlyphs[min((text.x >> (ch * 4)) & 0xF, 13u)];
+        if ((glyph >> ((4 - cell.y) * 3 + (2 - col))) & 1)
+            return float4(1, 1, 1, 1);
+    }
+    return float4(0, 0, 0, 1);
+}
 )";
         ComPtr<ID3D11GeometryShader> g_gs_rect, g_gs_quad, g_gs_point;
         ComPtr<ID3D11VertexShader> g_vs_blit;
         ComPtr<ID3D11PixelShader> g_ps_blit;
         ComPtr<ID3D11PixelShader> g_ps_depth_copy;
+        ComPtr<ID3D11PixelShader> g_ps_color_copy;
+        ComPtr<ID3D11Buffer> g_cb_copy;
+        ComPtr<ID3D11PixelShader> g_ps_text;
+        ComPtr<ID3D11Buffer> g_cb_text;
+        bool g_show_fps = true; // TT2_SHOW_FPS=0 hides the counter
+        uint32_t g_fps = 0;
         ComPtr<ID3D11SamplerState> g_blit_sampler;
 
         // ------------------------------------------------------------------ render targets
@@ -463,6 +491,23 @@ float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(i.pos.xy
             case 15: return DXGI_FORMAT_R32G32_FLOAT;       // k_32_32_FLOAT
             default: return DXGI_FORMAT_R16G16B16A16_FLOAT; // 16_16_16_16(_FLOAT), 2_10_10_10_FLOAT
             }
+        }
+
+        // Multisampled surfaces are kept at sample resolution: a pixel of a 2x surface is 1x2
+        // samples, of a 4x one 2x2. Surfaces are keyed by their width in samples, so a 4x clear at
+        // half the pitch (a common trick: a quarter of the pixels cover the same EDRAM) lands on the
+        // same surface as the normal render target there.
+        uint32_t msaa_x() { const uint32_t m = (r(RB_SURFACE_INFO) >> 16) & 3; return m >= 2 ? 2 : 1; }
+        uint32_t msaa_y() { const uint32_t m = (r(RB_SURFACE_INFO) >> 16) & 3; return m >= 1 ? 2 : 1; }
+        uint32_t sample_pitch() { return (r(RB_SURFACE_INFO) & 0x3FFF) * msaa_x(); }
+
+        // 20e4 float (24-bit depth: 4-bit exponent, 20-bit mantissa) to float.
+        float float20e4(uint32_t v)
+        {
+            const uint32_t e = (v >> 20) & 0xF, m = v & 0xFFFFF;
+            if (!e)
+                return std::ldexp(float(m) / 1048576.0f, -14);
+            return std::ldexp(1.0f + float(m) / 1048576.0f, int(e) - 15);
         }
 
         Surface* render_target(uint32_t info, uint32_t pitch, bool depth)
@@ -929,7 +974,8 @@ float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(i.pos.xy
             const uint32_t command = (control >> 20) & 3;
             const uint32_t src_select = control & 7;
             const bool depth = src_select >= 4;
-            const uint32_t pitch = r(RB_SURFACE_INFO) & 0x3FFF;
+            const uint32_t pitch = sample_pitch();
+            const uint32_t sx = msaa_x(), sy = msaa_y();
             Surface* src = render_target(depth ? r(RB_DEPTH_INFO) : r(RB_COLOR_INFO_REGS[src_select & 3]), pitch, depth);
             if (!src)
                 return;
@@ -968,8 +1014,8 @@ float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(i.pos.xy
                 x1 = std::clamp(x1, sx0, sx1);
                 y0 = std::clamp(y0, sy0, sy1);
                 y1 = std::clamp(y1, sy0, sy1);
-                x1 = std::min<int32_t>(x1, int32_t(src->width));
-                y1 = std::min<int32_t>(y1, int32_t(src->height));
+                x1 = std::min<int32_t>(x1, int32_t(src->width / sx));
+                y1 = std::min<int32_t>(y1, int32_t(src->height / sy));
             }
 
             if (command != 3 && x1 > x0 && y1 > y0)
@@ -979,8 +1025,10 @@ float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(i.pos.xy
                 const uint32_t dw = std::max(dp & 0x3FFF, uint32_t(x1)), dh = std::max((dp >> 16) & 0x3FFF, uint32_t(y1));
                 Resolved& res = g_resolved[dest];
                 // Depth is copied by a shader pass into an R32_FLOAT texture: Direct3D 11 only copies
-                // depth-stencil resources whole, between textures of the same size.
+                // depth-stencil resources whole, between textures of the same size. Multisampled
+                // colour is copied by a pass too (sample 0 of each pixel).
                 const DXGI_FORMAT dest_format = depth ? DXGI_FORMAT_R32_FLOAT : src->format;
+                const bool by_pass = depth || sx > 1 || sy > 1;
                 if (!res.surface.tex || res.width != dw || res.height != dh || res.surface.format != dest_format)
                 {
                     res = Resolved{};
@@ -996,9 +1044,9 @@ float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(i.pos.xy
                     d.Format = dest_format;
                     d.SampleDesc.Count = 1;
                     d.Usage = D3D11_USAGE_DEFAULT;
-                    d.BindFlags = D3D11_BIND_SHADER_RESOURCE | (depth ? D3D11_BIND_RENDER_TARGET : 0);
+                    d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
                     g_device->CreateTexture2D(&d, nullptr, &res.surface.tex);
-                    if (depth && res.surface.tex)
+                    if (res.surface.tex)
                         g_device->CreateRenderTargetView(res.surface.tex.Get(), nullptr, &res.surface.rtv);
                 }
                 res.frame = g_frame;
@@ -1014,18 +1062,21 @@ float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(i.pos.xy
                     D3D11_BOX box{ UINT(x0), UINT(y0), 0, UINT(std::min<int32_t>(x1, int32_t(dw))), UINT(std::min<int32_t>(y1, int32_t(dh))), 1 };
                     if (box.right > box.left && box.bottom > box.top)
                     {
-                        if (!depth)
+                        if (!by_pass)
                             g_ctx->CopySubresourceRegion(res.surface.tex.Get(), 0, UINT(x0), UINT(y0), 0, src->tex.Get(), 0, &box);
                         else if (res.surface.rtv)
                         {
                             if (!src->srv)
                             {
                                 D3D11_SHADER_RESOURCE_VIEW_DESC v{};
-                                v.Format = depth_srv_format(src->format);
+                                v.Format = depth ? depth_srv_format(src->format) : src->format;
                                 v.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
                                 v.Texture2D.MipLevels = 1;
                                 g_device->CreateShaderResourceView(src->tex.Get(), &v, &src->srv);
                             }
+                            const uint32_t scale[4] = { sx, sy, 0, 0 };
+                            update_cbuffer(g_cb_copy.Get(), scale, sizeof(scale));
+                            g_ctx->PSSetConstantBuffers(3, 1, g_cb_copy.GetAddressOf());
                             g_ctx->OMSetRenderTargets(1, res.surface.rtv.GetAddressOf(), nullptr); // also unbinds the depth surface
                             const D3D11_VIEWPORT vp{ 0, 0, float(dw), float(dh), 0, 1 };
                             const D3D11_RECT sc{ LONG(box.left), LONG(box.top), LONG(box.right), LONG(box.bottom) };
@@ -1038,7 +1089,7 @@ float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(i.pos.xy
                             g_ctx->IASetInputLayout(nullptr);
                             g_ctx->VSSetShader(g_vs_blit.Get(), nullptr, 0);
                             g_ctx->GSSetShader(nullptr, nullptr, 0);
-                            g_ctx->PSSetShader(g_ps_depth_copy.Get(), nullptr, 0);
+                            g_ctx->PSSetShader(depth ? g_ps_depth_copy.Get() : g_ps_color_copy.Get(), nullptr, 0);
                             g_ctx->PSSetShaderResources(0, 1, src->srv.GetAddressOf());
                             g_ctx->Draw(3, 0);
                             ID3D11ShaderResourceView* none = nullptr;
@@ -1096,7 +1147,7 @@ float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(i.pos.xy
                 {
                     const uint32_t v = r(RB_COLOR_CLEAR);
                     const float color[4] = { ((v >> 16) & 0xFF) / 255.0f, ((v >> 8) & 0xFF) / 255.0f, (v & 0xFF) / 255.0f, (v >> 24) / 255.0f };
-                    const D3D11_RECT rect{ x0, y0, x1, y1 };
+                    const D3D11_RECT rect{ LONG(x0 * sx), LONG(y0 * sy), LONG(x1 * sx), LONG(y1 * sy) };
                     if (g_ctx1 && x1 > x0 && y1 > y0)
                         g_ctx1->ClearView(c->rtv.Get(), color, &rect, 1);
                     else
@@ -1109,7 +1160,7 @@ float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(i.pos.xy
                 if (d && d->dsv)
                 {
                     const uint32_t v = r(RB_DEPTH_CLEAR);
-                    const float z = ((r(RB_DEPTH_INFO) >> 16) & 1) ? 1.0f : float(v >> 8) / 16777215.0f;
+                    const float z = ((r(RB_DEPTH_INFO) >> 16) & 1) ? float20e4(v >> 8) : float(v >> 8) / 16777215.0f;
                     g_ctx->ClearDepthStencilView(d->dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, z, UINT8(v & 0xFF));
                 }
             }
@@ -1199,7 +1250,8 @@ float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(i.pos.xy
             }
 
             // ---- render targets
-            const uint32_t pitch = r(RB_SURFACE_INFO) & 0x3FFF;
+            const uint32_t pitch = sample_pitch();
+            const uint32_t sx = msaa_x(), sy = msaa_y();
             const uint32_t color_mask = r(RB_COLOR_MASK);
             ID3D11RenderTargetView* rtvs[4] = {};
             uint32_t rt_width = 0, rt_height = kRtHeight;
@@ -1242,6 +1294,10 @@ float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(i.pos.xy
                 xo += 0.5f;
                 yo += 0.5f;
             }
+            xs *= float(sx);
+            xo *= float(sx);
+            ys *= float(sy);
+            yo *= float(sy);
             const float W = float(rt_width), H = float(rt_height);
             dc.ndc_scale[0] = xs * 2.0f / W;
             dc.ndc_offset[0] = xo * 2.0f / W - 1.0f;
@@ -1258,8 +1314,8 @@ float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(i.pos.xy
             dc.draw_flags[2] = (colorcontrol & 7) | (((colorcontrol >> 3) & 1) << 3);
             dc.alpha_ref[0] = rf(RB_ALPHA_REF);
             const uint32_t ps_size = r(PA_SU_POINT_SIZE);
-            dc.point_size[0] = float(ps_size >> 16) / 16.0f;
-            dc.point_size[1] = float(ps_size & 0xFFFF) / 16.0f;
+            dc.point_size[0] = float(ps_size >> 16) / 16.0f * float(sx);
+            dc.point_size[1] = float(ps_size & 0xFFFF) / 16.0f * float(sy);
             dc.point_size[2] = 2.0f / W;
             dc.point_size[3] = 2.0f / H;
 
@@ -1267,6 +1323,10 @@ float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(i.pos.xy
             g_ctx->RSSetViewports(1, &vp);
             int32_t sx0, sy0, sx1, sy1;
             scissor(sx0, sy0, sx1, sy1);
+            sx0 *= int32_t(sx);
+            sx1 *= int32_t(sx);
+            sy0 *= int32_t(sy);
+            sy1 *= int32_t(sy);
             const D3D11_RECT sc{ sx0, sy0, std::min<LONG>(sx1, LONG(W)), std::min<LONG>(sy1, LONG(H)) };
             g_ctx->RSSetScissorRects(1, &sc);
 
@@ -1727,6 +1787,14 @@ float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(i.pos.xy
         gs("gs_point", g_gs_point);
         if (auto code = compile(kFixedHlsl, "vs_blit", "vs_5_0", &error))
             g_device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_vs_blit);
+        if (auto code = compile(kFixedHlsl, "ps_text", "ps_5_0", &error))
+            g_device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_ps_text);
+        else
+            log("renderer: ps_text: %s", error.c_str());
+        if (auto code = compile(kFixedHlsl, "ps_color_copy", "ps_5_0", &error))
+            g_device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_ps_color_copy);
+        else
+            log("renderer: ps_color_copy: %s", error.c_str());
         if (auto code = compile(kFixedHlsl, "ps_depth_copy", "ps_5_0", &error))
             g_device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_ps_depth_copy);
         else
@@ -1745,6 +1813,10 @@ float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(i.pos.xy
         g_cb_ps_float = make_cbuffer(4096);
         g_cb_int = make_cbuffer(sizeof(IntConsts));
         g_cb_draw = make_cbuffer(sizeof(DrawConsts));
+        g_cb_copy = make_cbuffer(16);
+        g_cb_text = make_cbuffer(32);
+        if (const char* v = std::getenv("TT2_SHOW_FPS"))
+            g_show_fps = std::atoi(v) != 0;
 
         g_screenshot_dir = screenshot_dir;
         if (const char* v = std::getenv("TT2_SCREENSHOT"); v && std::atoi(v) > 0)
@@ -1782,6 +1854,58 @@ float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(i.pos.xy
     {
         if (g_active)
             do_draw(initiator, index_base, index_size);
+    }
+
+    namespace
+    {
+        // Frames presented per second, counted over half-second windows, drawn at the top right.
+        void draw_fps(ID3D11RenderTargetView* rtv)
+        {
+            using clock = std::chrono::steady_clock;
+            static clock::time_point window = clock::now();
+            static uint32_t frames = 0;
+            frames++;
+            const double elapsed = std::chrono::duration<double>(clock::now() - window).count();
+            if (elapsed >= 0.5)
+            {
+                g_fps = uint32_t(frames / elapsed + 0.5);
+                frames = 0;
+                window = clock::now();
+            }
+            // "<n> FPS"
+            uint32_t chars[8], n = 0;
+            char digits[12];
+            const int len = snprintf(digits, sizeof(digits), "%u", std::min(g_fps, 9999u));
+            for (int i = 0; i < len; i++)
+                chars[n++] = uint32_t(digits[i] - '0');
+            chars[n++] = 13;
+            chars[n++] = 10;
+            chars[n++] = 11;
+            chars[n++] = 12;
+            uint32_t packed = 0;
+            for (uint32_t i = 0; i < n; i++)
+                packed |= chars[i] << (i * 4);
+            const uint32_t scale = std::max(2u, g_backbuffer_h / 240);
+            const uint32_t bw = (4 * n + 1) * scale, bh = 7 * scale, margin = 2 * scale;
+            const uint32_t x = g_backbuffer_w > bw + margin ? g_backbuffer_w - bw - margin : 0;
+            const uint32_t consts[8] = { packed, n, x, margin, scale, 0, 0, 0 };
+            update_cbuffer(g_cb_text.Get(), consts, sizeof(consts));
+            const D3D11_VIEWPORT vp{ float(x), float(margin), float(bw), float(bh), 0.0f, 1.0f };
+            const D3D11_RECT sc{ LONG(x), LONG(margin), LONG(x + bw), LONG(margin + bh) };
+            g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
+            g_ctx->RSSetViewports(1, &vp);
+            g_ctx->RSSetScissorRects(1, &sc);
+            g_ctx->RSSetState(raster_state(0));
+            g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+            g_ctx->OMSetDepthStencilState(nullptr, 0);
+            g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            g_ctx->IASetInputLayout(nullptr);
+            g_ctx->VSSetShader(g_vs_blit.Get(), nullptr, 0);
+            g_ctx->GSSetShader(nullptr, nullptr, 0);
+            g_ctx->PSSetShader(g_ps_text.Get(), nullptr, 0);
+            g_ctx->PSSetConstantBuffers(4, 1, g_cb_text.GetAddressOf());
+            g_ctx->Draw(3, 0);
+        }
     }
 
     void swap(uint32_t frontbuffer_physical, uint32_t width, uint32_t height)
@@ -1848,6 +1972,8 @@ float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(i.pos.xy
                 log("renderer: front buffer %08X (%ux%u) was not resolved", frontbuffer_physical, width, height);
             }
         }
+        if (g_show_fps && g_ps_text)
+            draw_fps(rtv.Get());
         if (g_frame == g_dump_frame)
             log("dump: swap front buffer %08X %ux%u (%s)", frontbuffer_physical, width, height,
                 g_resolved.count(frontbuffer_physical & 0x1FFFF000) ? "resolved" : "not resolved");
