@@ -20,8 +20,12 @@ namespace tt2
         std::atomic<bool> g_running{ false };
         std::thread g_thread;
 
-        // Frame-locked time for rollback re-simulation: when set, the guest sees this value.
-        std::atomic<uint64_t> g_override{ 0 };
+        // Rollback: the simulation thread sees frame-locked time (frame base + a small step per
+        // read) so a re-simulated frame reads exactly the times the original did. Other
+        // threads keep the real clock (as in Tekken6-rollback's virtual timebase).
+        thread_local bool t_virtual = false;
+        thread_local uint64_t t_reads = 0;
+        std::atomic<uint64_t> g_frame_base{ 0 };
 
         uint64_t host_timebase()
         {
@@ -69,11 +73,20 @@ namespace tt2
         timeEndPeriod(1);
     }
 
-    void timebase_override(uint64_t value) { g_override = value; }
+    uint64_t timebase_now() { return host_timebase(); }
+
+    // Called by the simulation thread at each frame boundary (rollback active).
+    void timebase_frame(uint64_t frame_base)
+    {
+        t_virtual = true;
+        t_reads = 0;
+        g_frame_base = frame_base;
+    }
 }
 
 extern "C" uint64_t tt2_guest_timebase()
 {
-    const uint64_t o = tt2::g_override.load(std::memory_order_relaxed);
-    return o ? o : tt2::host_timebase();
+    if (tt2::t_virtual)
+        return tt2::g_frame_base.load(std::memory_order_relaxed) + (++tt2::t_reads) * 50;
+    return tt2::host_timebase();
 }

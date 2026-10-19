@@ -12,6 +12,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <type_traits>
 
 namespace tt2
@@ -140,6 +141,7 @@ namespace tt2
     }
 
     void log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+    std::string guest_backtrace(uint32_t r1, int depth); // main.cpp
     [[noreturn]] void fatal(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 }
 
@@ -150,6 +152,14 @@ namespace tt2
 {
     extern bool g_trace_imports;
     void trace_import(const char* name, const PPCContext& ctx);
+    // The import this thread is executing (shown by the thread dump), or null.
+    extern thread_local const char* t_current_import;
+    struct ImportScope
+    {
+        const char* previous;
+        explicit ImportScope(const char* name) : previous(t_current_import) { t_current_import = name; }
+        ~ImportScope() { t_current_import = previous; }
+    };
 }
 #define TT2_IMPORT(name)                                         \
     static void tt2_impl_##name(PPCContext& ctx, uint8_t* base); \
@@ -157,6 +167,7 @@ namespace tt2
     {                                                            \
         if (tt2::g_trace_imports) [[unlikely]]                   \
             tt2::trace_import(#name, ctx);                       \
+        tt2::ImportScope tt2_scope(#name);                       \
         tt2_impl_##name(ctx, base);                              \
     }                                                            \
     static void tt2_impl_##name([[maybe_unused]] PPCContext& ctx, [[maybe_unused]] uint8_t* base)

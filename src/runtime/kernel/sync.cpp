@@ -5,7 +5,9 @@
 #include "../memory.h"
 
 #include <immintrin.h>
+#include <condition_variable>
 #include <thread>
+#include <unordered_map>
 
 using namespace tt2;
 using namespace tt2::kernel;
@@ -57,21 +59,6 @@ namespace
     // Thread identity used by critical sections and spinlocks: the KTHREAD pointer (PCR+0x100).
     uint32_t owner_id(const PPCContext& ctx) { return load32(ctx.r13.u32 + 0x100); }
 
-    bool cas32(uint32_t guest, uint32_t expected, uint32_t desired)
-    {
-        uint32_t e = byteswap(expected);
-        return __atomic_compare_exchange_n(reinterpret_cast<uint32_t*>(g_base + guest), &e, byteswap(desired), false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
-    }
-
-    void backoff(int& spins)
-    {
-        if (++spins < 64)
-            _mm_pause();
-        else if (spins < 256)
-            std::this_thread::yield();
-        else
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
-    }
 }
 
 // ---------------------------------------------------------------------- events
@@ -110,11 +97,15 @@ TT2_IMPORT(NtPulseEvent)
     auto e = handle_as<Event>(a.u32(0));
     if (!e)
         return a.ret(status::invalid_handle);
-    // Wake current waiters, then reset. With the condition-variable model a waiter must
-    // observe the signal, so keep it set for a moment.
-    const uint32_t previous = set_event(*e);
-    std::this_thread::yield();
-    reset_event(*e);
+    // Releases the threads waiting right now (they see the pulse count change), then the
+    // event is unsignaled.
+    uint32_t previous = 0;
+    with_lock([&] {
+        previous = e->signaled;
+        e->pulses++;
+        e->signaled = false;
+        e->mirror_signal_state(0);
+    });
     write_out<int32_t>(a, 1, int32_t(previous));
     a.ret(status::success);
 }
@@ -255,17 +246,29 @@ TT2_IMPORT(NtWaitForSingleObjectEx)
 TT2_IMPORT(NtSignalAndWaitForSingleObjectEx)
 {
     Args a{ ctx };
+    // (signal, wait, alertable, ?, timeout*). The signal happens under the wait lock, so the
+    // pair is atomic as on the console: a thread woken by the signal (e.g. one taking a
+    // released mutex and pulsing an event) cannot run before this thread is waiting.
     auto signal = object_from_handle(a.u32(0));
-    if (auto e = std::dynamic_pointer_cast<Event>(signal))
-        set_event(*e);
-    else if (auto s = std::dynamic_pointer_cast<Semaphore>(signal))
-        with_lock([&] { s->count = std::min(s->count + 1, s->limit); });
-    else if (auto m = std::dynamic_pointer_cast<Mutant>(signal))
-        with_lock([&] {
-            if (m->owner == current_thread_id() && --m->recursion == 0)
+    auto target = object_from_handle(a.u32(1));
+    if (!target)
+        return a.ret(status::invalid_handle);
+    const uint32_t me = current_thread_id();
+    auto before = [&] {
+        if (auto e = std::dynamic_pointer_cast<Event>(signal))
+        {
+            e->signaled = true;
+            e->mirror_signal_state(1);
+        }
+        else if (auto s = std::dynamic_pointer_cast<Semaphore>(signal))
+            s->count = std::min(s->count + 1, s->limit);
+        else if (auto m = std::dynamic_pointer_cast<Mutant>(signal))
+        {
+            if (m->owner == me && --m->recursion == 0)
                 m->owner = 0;
-        });
-    a.ret(wait_one(object_from_handle(a.u32(1)), a.ptr<be<int64_t>>(4), a.u32(3) != 0));
+        }
+    };
+    a.ret(wait({ target }, false, deadline_from_nt(a.ptr<be<int64_t>>(4)), a.u32(2) != 0, before));
 }
 
 TT2_IMPORT(KeWaitForSingleObject)
@@ -347,40 +350,118 @@ TT2_IMPORT(KeInsertQueueDpc)
     a.ret(1);
 }
 
-// ---------------------------------------------------------------------- spinlocks
+// ---------------------------------------------------------------------- spinlocks and critical sections
+//
+// Lock state lives on the host, keyed by the guest address of the lock, not in the guest
+// structure: rollback rewinds guest memory, and a rewound "owner" field would resurrect a lock
+// that was released long ago (deadlocking whoever waits for it). Guest code only reaches these
+// locks through the kernel calls below. The guest fields are still updated for code that reads
+// them (debug checks).
+
+namespace
+{
+    struct HostLock
+    {
+        uint32_t owner = 0;     // KTHREAD pointer of the owner, 0 = free
+        int32_t recursion = 0;
+    };
+
+    std::mutex g_locks_mutex;
+    std::condition_variable g_locks_cv;
+    std::unordered_map<uint32_t, HostLock> g_locks; // node-based: references stay valid
+
+    void acquire(uint32_t address, uint32_t me, bool recursive)
+    {
+        std::unique_lock lock(g_locks_mutex);
+        HostLock& l = g_locks[address];
+        if (recursive && l.owner == me)
+        {
+            l.recursion++;
+            return;
+        }
+        g_locks_cv.wait(lock, [&] { return l.owner == 0; });
+        l.owner = me;
+        l.recursion = 1;
+    }
+
+    bool try_acquire(uint32_t address, uint32_t me)
+    {
+        std::lock_guard lock(g_locks_mutex);
+        HostLock& l = g_locks[address];
+        if (l.owner == me)
+        {
+            l.recursion++;
+            return true;
+        }
+        if (l.owner != 0)
+            return false;
+        l.owner = me;
+        l.recursion = 1;
+        return true;
+    }
+
+    // Returns the remaining recursion count.
+    int32_t release(uint32_t address)
+    {
+        int32_t remaining = 0;
+        {
+            std::lock_guard lock(g_locks_mutex);
+            HostLock& l = g_locks[address];
+            if (l.recursion > 0)
+                l.recursion--;
+            remaining = l.recursion;
+            if (remaining == 0)
+                l.owner = 0;
+        }
+        if (remaining == 0)
+            g_locks_cv.notify_all();
+        return remaining;
+    }
+
+    void reset(uint32_t address)
+    {
+        std::lock_guard lock(g_locks_mutex);
+        g_locks[address] = HostLock{};
+    }
+
+    // RTL_CRITICAL_SECTION: 16-byte dispatcher header, +0x10 LockCount, +0x14 RecursionCount,
+    // +0x18 OwningThread.
+    void mirror_cs(uint32_t cs, uint32_t owner, int32_t recursion)
+    {
+        store32(cs + 0x10, recursion ? 0 : 0xFFFFFFFF);
+        store32(cs + 0x14, uint32_t(recursion));
+        store32(cs + 0x18, owner);
+    }
+}
+
+namespace tt2::kernel
+{
+    // Debugging: every held lock and its owner (KTHREAD pointer).
+    void dump_locks()
+    {
+        std::vector<std::pair<uint32_t, HostLock>> held;
+        {
+            std::lock_guard lock(g_locks_mutex);
+            for (auto& [address, l] : g_locks)
+                if (l.owner)
+                    held.push_back({ address, l });
+        }
+        for (auto& [address, l] : held)
+            log("  lock %08X held by KTHREAD %08X (recursion %d)", address, l.owner, l.recursion);
+    }
+}
 
 TT2_IMPORT(KfAcquireSpinLock)
 {
-    const uint32_t lock = ctx.r3.u32;
-    const uint32_t me = owner_id(ctx);
-    int spins = 0;
-    while (!cas32(lock, 0, me))
-        backoff(spins);
+    acquire(ctx.r3.u32, owner_id(ctx), false);
     ctx.r3.u64 = 0; // previous IRQL
 }
 
-TT2_IMPORT(KfReleaseSpinLock)
-{
-    __atomic_store_n(reinterpret_cast<uint32_t*>(g_base + ctx.r3.u32), 0u, __ATOMIC_RELEASE);
-}
+TT2_IMPORT(KfReleaseSpinLock) { release(ctx.r3.u32); }
 
-TT2_IMPORT(KeAcquireSpinLockAtRaisedIrql)
-{
-    const uint32_t lock = ctx.r3.u32;
-    const uint32_t me = owner_id(ctx);
-    int spins = 0;
-    while (!cas32(lock, 0, me))
-        backoff(spins);
-}
+TT2_IMPORT(KeAcquireSpinLockAtRaisedIrql) { acquire(ctx.r3.u32, owner_id(ctx), false); }
 
-TT2_IMPORT(KeReleaseSpinLockFromRaisedIrql)
-{
-    __atomic_store_n(reinterpret_cast<uint32_t*>(g_base + ctx.r3.u32), 0u, __ATOMIC_RELEASE);
-}
-
-// ---------------------------------------------------------------------- critical sections
-// RTL_CRITICAL_SECTION: 16-byte dispatcher header, +0x10 LockCount, +0x14 RecursionCount,
-// +0x18 OwningThread.
+TT2_IMPORT(KeReleaseSpinLockFromRaisedIrql) { release(ctx.r3.u32); }
 
 TT2_IMPORT(RtlInitializeCriticalSection)
 {
@@ -388,6 +469,7 @@ TT2_IMPORT(RtlInitializeCriticalSection)
     std::memset(g_base + cs, 0, 0x1C);
     g_base[cs] = 1; // synchronization event type in the header
     store32(cs + 0x10, 0xFFFFFFFF);
+    reset(cs);
 }
 
 TT2_IMPORT(RtlInitializeCriticalSectionAndSpinCount)
@@ -396,6 +478,7 @@ TT2_IMPORT(RtlInitializeCriticalSectionAndSpinCount)
     std::memset(g_base + cs, 0, 0x1C);
     g_base[cs] = 1;
     store32(cs + 0x10, 0xFFFFFFFF);
+    reset(cs);
     ctx.r3.u64 = status::success;
 }
 
@@ -403,48 +486,26 @@ TT2_IMPORT(RtlEnterCriticalSection)
 {
     const uint32_t cs = ctx.r3.u32;
     const uint32_t me = owner_id(ctx);
-    if (load32(cs + 0x18) == me)
-    {
-        store32(cs + 0x14, load32(cs + 0x14) + 1);
-        return;
-    }
-    int spins = 0;
-    while (!cas32(cs + 0x18, 0, me))
-        backoff(spins);
-    store32(cs + 0x14, 1);
-    store32(cs + 0x10, load32(cs + 0x10) + 1);
+    acquire(cs, me, true);
+    mirror_cs(cs, me, int32_t(load32(cs + 0x14)) + 1);
 }
 
 TT2_IMPORT(RtlTryEnterCriticalSection)
 {
     const uint32_t cs = ctx.r3.u32;
     const uint32_t me = owner_id(ctx);
-    if (load32(cs + 0x18) == me)
+    if (try_acquire(cs, me))
     {
-        store32(cs + 0x14, load32(cs + 0x14) + 1);
+        mirror_cs(cs, me, int32_t(load32(cs + 0x14)) + 1);
         ctx.r3.u64 = 1;
-        return;
     }
-    if (cas32(cs + 0x18, 0, me))
-    {
-        store32(cs + 0x14, 1);
-        store32(cs + 0x10, load32(cs + 0x10) + 1);
-        ctx.r3.u64 = 1;
-        return;
-    }
-    ctx.r3.u64 = 0;
+    else
+        ctx.r3.u64 = 0;
 }
 
 TT2_IMPORT(RtlLeaveCriticalSection)
 {
     const uint32_t cs = ctx.r3.u32;
-    const uint32_t recursion = load32(cs + 0x14);
-    if (recursion > 1)
-    {
-        store32(cs + 0x14, recursion - 1);
-        return;
-    }
-    store32(cs + 0x14, 0);
-    store32(cs + 0x10, load32(cs + 0x10) - 1);
-    __atomic_store_n(reinterpret_cast<uint32_t*>(g_base + cs + 0x18), 0u, __ATOMIC_RELEASE);
+    const int32_t remaining = release(cs);
+    mirror_cs(cs, remaining ? load32(cs + 0x18) : 0, remaining);
 }

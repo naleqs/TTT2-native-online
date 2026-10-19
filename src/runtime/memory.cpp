@@ -38,6 +38,11 @@ namespace tt2
             used_[start] = size;
             return start;
         };
+        auto notify = [&](uint32_t start) {
+            if (start && on_alloc)
+                on_alloc(start, size);
+            return start;
+        };
 
         if (top_down)
         {
@@ -48,7 +53,7 @@ namespace tt2
                     continue;
                 const uint32_t start = uint32_t((block_end - size) & ~uint64_t(alignment - 1));
                 if (start >= it->first)
-                    return take(std::prev(it.base()), start);
+                    return notify(take(std::prev(it.base()), start));
             }
             return 0;
         }
@@ -57,7 +62,7 @@ namespace tt2
         {
             const uint32_t start = (it->first + alignment - 1) & ~(alignment - 1);
             if (start >= it->first && uint64_t(start) + size <= uint64_t(it->first) + it->second)
-                return take(it, start);
+                return notify(take(it, start));
         }
         return 0;
     }
@@ -81,6 +86,8 @@ namespace tt2
         if (uint64_t(address) + size < block_end)
             free_[address + size] = uint32_t(block_end - address - size);
         used_[address] = size;
+        if (on_alloc)
+            on_alloc(address, size);
         return true;
     }
 
@@ -132,6 +139,18 @@ namespace tt2
         start = it->first;
         size = it->second;
         return true;
+    }
+
+    void RangeAllocator::set_on_alloc(std::function<void(uint32_t, uint32_t)> fn)
+    {
+        std::lock_guard lock(mutex_);
+        on_alloc = std::move(fn);
+    }
+
+    std::vector<std::pair<uint32_t, uint32_t>> RangeAllocator::ranges() const
+    {
+        std::lock_guard lock(mutex_);
+        return { used_.begin(), used_.end() };
     }
 
     uint64_t RangeAllocator::used() const

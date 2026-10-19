@@ -19,6 +19,11 @@ namespace tt2::kernel
         uint32_t exit_code = 0;
         int suspend_count = 0;
         std::thread host;
+        void* native = nullptr;      // Win32 handle of the host thread (for NtSuspendThread)
+        bool started = false;        // running guest code (a suspended start has not begun)
+        bool frozen = false;         // suspended by another thread with Win32 SuspendThread
+        PPCContext* context = nullptr; // live registers (read racily by the thread dump)
+        const char* const* current_import = nullptr; // this thread's t_current_import
         std::string name;
 
         ObjectType type() const override { return ObjectType::Thread; }
@@ -35,6 +40,12 @@ namespace tt2::kernel
     std::shared_ptr<Thread> adopt_host_thread(const char* name);
 
     std::shared_ptr<Thread> current_thread();
+
+    // Debugging: logs every guest thread's link register and guest backtrace.
+    void dump_threads();
+    // Guest function whose recompiled code contains the host address (0: not game code).
+    uint32_t guest_function_at(uintptr_t rip);
+    void for_each_thread(const std::function<void(Thread&)>& fn);
 
     // Thrown by ExTerminateThread and caught at the top of the thread.
     struct ThreadExit

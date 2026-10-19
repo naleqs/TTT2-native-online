@@ -11,6 +11,8 @@
 
 namespace tt2
 {
+    thread_local const char* t_current_import = nullptr;
+
     namespace
     {
         thread_local PPCContext* t_context = nullptr;
@@ -36,6 +38,14 @@ namespace tt2::kernel
         constexpr uint32_t kBlockSize = kPcrSize + kTlsSlotsSize + kTebSize;
 
         thread_local std::shared_ptr<Thread> t_thread;
+        std::mutex g_registry_mutex;
+        std::vector<std::weak_ptr<Thread>> g_registry;
+
+        void register_thread(const std::shared_ptr<Thread>& t)
+        {
+            std::lock_guard lock(g_registry_mutex);
+            g_registry.push_back(t);
+        }
         thread_local uint32_t t_tls[64]{};
         std::atomic<uint32_t> g_next_thread_id{ 1 };
 
@@ -73,22 +83,20 @@ namespace tt2::kernel
         void run_guest_thread(std::shared_ptr<Thread> self)
         {
             t_thread = self;
-            {
-                std::unique_lock lock(wait_mutex());
-                // Suspended threads start on NtResumeThread.
-                while (self->suspend_count > 0)
-                {
-                    lock.unlock();
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    lock.lock();
-                }
-            }
+            HANDLE native = nullptr;
+            DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &native, 0, FALSE, DUPLICATE_SAME_ACCESS);
+            self->native = native;
+            // Threads created suspended start on NtResumeThread.
+            block_until([&] { return self->suspend_count <= 0; });
+            with_lock([&] { self->started = true; });
 
             PPCContext ctx{};
             ctx.r1.u64 = self->stack_base + self->stack_size - 0x100;
             ctx.r13.u64 = self->pcr;
             ctx.fpscr.loadFromHost();
             set_current_context(&ctx);
+            self->context = &ctx;
+            self->current_import = &t_current_import;
 
             uint32_t code = 0;
             try
@@ -115,6 +123,7 @@ namespace tt2::kernel
                 self->exited = true;
                 self->exit_code = code;
             });
+            self->context = nullptr; // the PPCContext lives on this host stack
             set_current_context(nullptr);
         }
     }
@@ -136,6 +145,7 @@ namespace tt2::kernel
         t->suspend_count = suspended ? 1 : 0;
         t->name = name ? name : "";
         register_body(t, 0);
+        register_thread(t);
         t->host = std::thread(run_guest_thread, t);
         return t;
     }
@@ -146,6 +156,7 @@ namespace tt2::kernel
         setup_guest_identity(*t, 64 * 1024);
         t->name = name;
         register_body(t, 0);
+        register_thread(t);
         t_thread = t;
 
         auto* ctx = new PPCContext{};
@@ -153,10 +164,77 @@ namespace tt2::kernel
         ctx->r13.u64 = t->pcr;
         ctx->fpscr.loadFromHost();
         set_current_context(ctx);
+        t->context = ctx;
+        t->current_import = &t_current_import;
         return t;
     }
 
     std::shared_ptr<Thread> current_thread() { return t_thread; }
+
+    void for_each_thread(const std::function<void(Thread&)>& fn)
+    {
+        std::lock_guard lock(g_registry_mutex);
+        for (auto& w : g_registry)
+            if (auto t = w.lock())
+                fn(*t);
+    }
+
+    // Guest function whose recompiled host code contains `rip` (nearest host start below it).
+    uint32_t guest_function_at(uintptr_t rip)
+    {
+        static std::vector<std::pair<uintptr_t, uint32_t>> table; // host start -> guest address
+        if (table.empty())
+        {
+            for (size_t i = 0; PPCFuncMappings[i].guest; i++)
+                if (PPCFuncMappings[i].host)
+                    table.push_back({ reinterpret_cast<uintptr_t>(PPCFuncMappings[i].host), uint32_t(PPCFuncMappings[i].guest) });
+            std::sort(table.begin(), table.end());
+        }
+        if (table.empty() || rip < table.front().first || rip > table.back().first + 0x100000)
+            return 0; // not recompiled game code (runtime or system code)
+        auto it = std::upper_bound(table.begin(), table.end(), std::make_pair(rip, UINT32_MAX));
+        return it == table.begin() ? 0 : std::prev(it)->second;
+    }
+
+    void dump_locks(); // sync.cpp
+
+    void dump_threads()
+    {
+        std::lock_guard lock(g_registry_mutex);
+        log("---- guest threads ----");
+        // Where each host thread is executing right now, as a guest function. Nothing may be
+        // logged (or allocated) while a thread is suspended: it could hold that lock.
+        std::vector<std::pair<uint32_t, uintptr_t>> positions;
+        positions.reserve(g_registry.size());
+        for (auto& w : g_registry)
+        {
+            auto t = w.lock();
+            if (!t || !t->native || t->exited || t.get() == current_thread().get())
+                continue;
+            if (SuspendThread(t->native) == DWORD(-1))
+                continue;
+            CONTEXT c{};
+            c.ContextFlags = CONTEXT_CONTROL;
+            const bool ok = GetThreadContext(t->native, &c);
+            ResumeThread(t->native);
+            if (ok)
+                positions.push_back({ t->id, uintptr_t(c.Rip) });
+        }
+        for (auto [id, rip] : positions)
+            if (const uint32_t fn = guest_function_at(rip))
+                log("  t%u is running game code in sub_%08X", id, fn);
+        for (auto& w : g_registry)
+        {
+            auto t = w.lock();
+            if (!t || !t->context || t->exited)
+                continue;
+            const PPCContext* c = t->context;
+            const char* import = t->current_import ? *t->current_import : nullptr;
+            log("  t%u %-22s KTHREAD %08X %s%s lr=%08llX r3=%08X r1=%08X%s", t->id, t->name.c_str(), load32(t->pcr + 0x100), import ? "in " : "",
+                import ? import : "", (unsigned long long)c->lr, c->r3.u32, c->r1.u32, guest_backtrace(c->r1.u32, 14).c_str());
+        }
+        dump_locks();
+    }
 
     std::shared_ptr<Object> current_thread_object() { return t_thread; }
 
@@ -192,11 +270,18 @@ TT2_IMPORT(NtResumeThread)
     if (!t)
         return a.ret(status::invalid_handle);
     int previous = 0;
+    bool resume_host = false;
     with_lock([&] {
         previous = t->suspend_count;
         if (t->suspend_count > 0)
             t->suspend_count--;
+        // A running thread suspended by another thread was frozen with Win32 SuspendThread.
+        resume_host = t->suspend_count == 0 && previous > 0 && t->started && t->frozen;
+        if (resume_host)
+            t->frozen = false;
     });
+    if (resume_host && t->native)
+        ResumeThread(t->native);
     if (auto* p = a.ptr<be<uint32_t>>(1))
         *p = uint32_t(previous);
     a.ret(status::success);
@@ -208,15 +293,29 @@ TT2_IMPORT(NtSuspendThread)
     auto t = handle_as<Thread>(a.u32(0));
     if (!t)
         return a.ret(status::invalid_handle);
-    // A running host thread cannot be frozen safely from outside; only threads that have not
-    // started yet honour this. Logged so it shows up if the game relies on it.
     int previous = 0;
-    with_lock([&] { previous = t->suspend_count++; });
-    if (previous == 0 && t.get() != current_thread().get())
-        log("kernel: NtSuspendThread on running thread %u is not enforced", t->id);
+    bool freeze_host = false;
+    const bool self = t.get() == current_thread().get();
+    with_lock([&] {
+        previous = t->suspend_count++;
+        freeze_host = !self && previous == 0 && t->started && !t->exited;
+        if (freeze_host)
+            t->frozen = true;
+    });
     if (auto* p = a.ptr<be<uint32_t>>(1))
         *p = uint32_t(previous);
     a.ret(status::success);
+
+    if (self)
+    {
+        // Suspending yourself blocks until another thread resumes you (the XAPI idiom for
+        // "sleep until woken"). Returning at once would turn it into a busy loop.
+        block_until([&] { return t->suspend_count <= 0; });
+    }
+    else if (freeze_host && t->native)
+    {
+        SuspendThread(t->native);
+    }
 }
 
 TT2_IMPORT(KeDelayExecutionThread)

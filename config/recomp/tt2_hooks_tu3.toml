@@ -1,0 +1,21 @@
+# Hand-maintained additions to the generated recompiler config, for Default.xex patched with
+# Title Update 3 (patched SHA-1 04b49c51f5358f9ce6cdb7d04d50aa05722a5465). setup.ps1 appends this
+# file instead of tt2_hooks.toml when it applies that update. See src/runtime/game/tt2_frame.cpp.
+
+# ---------------------------------------------------------------------------------------
+# Main loop frame boundary: top of the loop in sub_82583288. r20, r21, r26, r27 and r30 are the
+# loop's invariants that game/tt2_frame.cpp needs to re-run a frame.
+[[midasm_hook]]
+name = "Tt2FrameBoundary"
+address = 0x825832FC
+registers = ["r20", "r21", "r26", "r27", "r30"]
+
+# The draw pass of each frame (sub_825EF0B8 + sub_825EBCC8). Pages the main thread first writes
+# while drawing are presentation state for the render thread, not game state.
+[[midasm_hook]]
+name = "Tt2DrawBegin"
+address = 0x82583474
+
+[[midasm_hook]]
+name = "Tt2DrawEnd"
+address = 0x82583484

@@ -21,6 +21,9 @@ namespace tt2
     };
 
     extern ImageInfo g_image;
+
+    // Guest address of the image's first writable section (.data), from its PE header.
+    uint32_t image_data_start();
     // XEX optional headers: key -> inline value, or guest address of a copy of the data.
     extern std::map<uint32_t, uint32_t> g_xex_headers;
 

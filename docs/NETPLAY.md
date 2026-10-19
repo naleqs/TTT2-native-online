@@ -42,23 +42,30 @@ actually pressed.
 
 ## Game state (`src/runtime/rollback/snapshot.cpp`)
 
-Guest memory is one 4 GB region reserved with `MEM_WRITE_WATCH`, so Windows records which pages
-are written. At each frame boundary, the pages written during the frame are copied into an undo
-record, and a shadow copy keeps the state of the last saved frame. Loading frame *j* replays the
-undo records from the newest back to *j*. The cost is proportional to the pages the game touched,
-typically a few hundred 4 KB pages per frame. Ranges that must never roll back (audio streams,
-the GPU ring, file buffers) can be excluded.
+After every save the game's pages are write-protected. The first write to a page decides what it
+is, following Tekken6-rollback's "foreign pages":
 
-## Integration with the game (`src/runtime/netplay_glue.cpp`)
+- written by the main thread's update pass: game state, saved and rolled back
+- written by any other thread, or by the main thread while drawing: presentation or worker
+  state, never rolled back (restoring it under its owner's feet would corrupt it)
 
-- **Frame boundary:** the first read of controller port 0 after each presented frame, the same
-  point Tekken6-rollback hooks on the PS3 (`cellPadGetData`).
+Saving a frame copies the previous contents of the pages the frame changed into an undo record.
+Loading replays undo records from the newest back to the target. A few hundred 4 KB pages per
+frame: about 0.07 ms per save and 0.2 ms per load in the game.
+
+## Integration with the game (`src/runtime/rollback/game_rollback.cpp`)
+
+- **Frame boundary:** a mid-asm hook at the top of the game's main loop (`Tt2FrameBoundary`,
+  `config/recomp/tt2_hooks.toml`). One loop iteration is one frame. Re-simulation re-runs the
+  iteration's update calls (`src/runtime/game/tt2_frame.cpp`) without the draw pass.
 - **Inputs** are digital on the wire: the left stick becomes the D-pad and the triggers become
-  buttons. Both machines therefore feed the game identical values, whichever controllers are used.
-- **Current mode: lockstep.** Rolling back needs to re-run a frame on demand, which needs the
-  address of the game's per-frame function (`config/recomp/tt2_hooks.toml`). Until that is found,
-  the session runs with a prediction window of 0: classic delay-based netcode with the automatic
-  input delay. Once the hook exists, the same session code switches to rollback.
+  buttons. They are frozen at the frame boundary, so a frame and its re-run read identical values.
+- **Time:** the main thread sees frame-locked time (frame x 1/60 s), other threads the real
+  clock.
+- **Locks:** kernel lock state lives outside game memory, so a rollback never resurrects a held
+  lock.
+- **Missing:** a sync point at fight start (both players must roll back from the same state),
+  and in-game desync detection. See `docs/STATUS.md`.
 
 ## Lobby (`src/netplay/src/lobby.cpp`)
 

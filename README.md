@@ -8,9 +8,10 @@ compiles it on your PC, then runs it on a small native runtime that stands in fo
 kernel. Nothing from the game ships with this project. You need your own disc, and setup checks
 that you have it.
 
-> **Status: early development, not playable yet.** The recompiled game code boots and runs its
-> startup natively, but the graphics renderer doesn't exist yet, so nothing is drawn. Audio is
-> partial. The netcode, lobby, launcher and setup pipeline are done and tested. See
+> **Status: early development, not playable yet.** The recompiled game boots and runs its main
+> loop natively at 60 fps, and rollback works inside the running game. The new Direct3D 11
+> renderer draws the intro movie; menus and fights are still being brought up. Music and voices
+> are silent. See
 > [docs/STATUS.md](docs/STATUS.md) for what works and what's next.
 
 ---
@@ -28,7 +29,8 @@ that you have it.
 ## Installation (first time only)
 
 1. Download the latest release and extract it into its own folder. Avoid `Program Files`.
-2. Put your disc image in the **`iso`** folder.
+2. Put your disc image in the **`iso`** folder. Optionally, put your own title update and DLC
+   packages in the **`dlc`** folder (see below).
 3. Run **`TTT2 Native Online.exe`** and choose **Set up the game**. You can also run
    **`Setup.bat`** directly.
 4. Setup then runs on its own, which takes about 5 to 10 minutes. It:
@@ -45,6 +47,19 @@ folder removes it completely. A log of the build is written to `native\build.log
 
 After an update that changes game code, choose **Rebuild the game**. Your verified game data is
 kept, so you don't need the ISO again.
+
+### Title update and DLC (optional)
+
+Copy the package files from your Xbox 360 into the **`dlc`** folder as they are. Subfolders are
+fine. Setup checks every package against its own hashes and only accepts packages for this game.
+
+- **Title update:** Title Update 3 (the newest; it includes the earlier ones) is applied to
+  `Default.xex` before the game is translated. Older updates are ignored.
+- **DLC:** each package is installed into `native\dlc` and the game sees it as installed
+  content, e.g. the Bonus Tracks packs.
+
+After adding or removing packages, choose **Rebuild the game** (or run `Setup.bat -Rebuild`).
+For online play both players need the same title update; the lobby only pairs identical builds.
 
 ## Playing
 
@@ -107,9 +122,9 @@ ctest --test-dir build
 | `tools/setup` | First-time setup: verifies and extracts your disc (XDVDFS reader), fetches the toolchain, runs the build |
 | `tools/tt2-analyze` | Finds everything the recompiler needs in *your* `Default.xex`: register save/restore helpers, around 600 jump tables, function boundaries, kernel imports |
 | `tools/recomp-patches` | Fixes for [XenonRecomp](https://github.com/hedge-dev/XenonRecomp): about 70 PowerPC/VMX instructions this game uses that upstream doesn't implement yet, plus loader and division fixes |
-| `src/runtime` | The native runtime: guest memory, the Xbox 360 kernel and XAM functions the game imports, threads and synchronization, file system, controllers, audio, and a "null" GPU command processor |
+| `src/runtime` | The native runtime: guest memory, the Xbox 360 kernel and XAM functions the game imports, threads and synchronization, file system, controllers, audio, the GPU command processor, a Xenos-to-HLSL shader translator and the Direct3D 11 renderer |
 | `src/netplay` | Rollback session, UDP and WebRTC transports, P2P lobby |
-| `src/runtime/rollback` | Per-frame snapshots of guest memory using Windows write-watch dirty-page tracking |
+| `src/runtime/rollback` | Per-frame snapshots of the game's memory, tracking changed pages with page protection |
 | `src/launcher` | The controller-driven launcher |
 
 More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/NETPLAY.md](docs/NETPLAY.md).

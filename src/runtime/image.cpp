@@ -156,3 +156,27 @@ namespace tt2
         return true;
     }
 }
+
+namespace tt2
+{
+    uint32_t image_data_start()
+    {
+        // The loaded image starts with its PE headers: e_lfanew, then IMAGE_NT_HEADERS and the
+        // section table (little-endian).
+        const uint32_t b = g_image.base;
+        auto le16 = [](uint32_t a) { return uint32_t(g_base[a] | (g_base[a + 1] << 8)); };
+        auto le32 = [&](uint32_t a) { return le16(a) | (le16(a + 2) << 16); };
+        if (g_base[b] != 'M' || g_base[b + 1] != 'Z')
+            return b;
+        const uint32_t nt = b + le32(b + 0x3C);
+        const uint32_t sections = le16(nt + 6);
+        const uint32_t table = nt + 24 + le16(nt + 20);
+        for (uint32_t i = 0; i < sections; i++)
+        {
+            const uint32_t s = table + i * 40;
+            if (le32(s + 36) & 0x80000000) // IMAGE_SCN_MEM_WRITE
+                return b + le32(s + 12);
+        }
+        return b;
+    }
+}

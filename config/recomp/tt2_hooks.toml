@@ -1,23 +1,26 @@
 # Hand-maintained additions to the generated recompiler config. setup.ps1 appends this file
 # to native/build/recomp/tt2_recomp.toml after tt2-analyze has written the generated part.
 #
-# Mid-asm hooks call into the runtime at fixed instructions of the game. They are what the
-# rollback netcode needs from the game (see docs/NETPLAY.md):
-#
-#   * Tt2FrameBoundary  - top of the main loop, once per game frame. Rollback saves/loads
-#                         state and re-simulates frames here (Tekken6-rollback hooks the
-#                         same point of Tekken 6).
-#   * Tt2FightStart     - the fight scene became active (rollback is only enabled in fights).
-#   * Tt2FightEnd       - KO / result screen reached.
-#
-# The addresses are not known yet; finding them is the next reverse-engineering step and
-# is tracked in docs/STATUS.md. Until then the runtime falls back to treating the first
-# XamInputGetState call of each frame as the frame boundary, like Tekken6-rollback's pad
-# read hook.
-#
-# Example (address is a placeholder - do not enable as is):
-#
-# [[midasm_hook]]
-# name = "Tt2FrameBoundary"
-# address = 0x00000000
-# registers = ["r3"]
+# Mid-asm hooks call into the runtime at fixed instructions of the game. The addresses are for
+# Tekken Tag Tournament 2 (USA, Europe), the only executable setup accepts. See
+# src/runtime/game/tt2_frame.cpp for what each hook does.
+
+# ---------------------------------------------------------------------------------------
+# Main loop frame boundary of Tekken Tag Tournament 2 (USA, Europe), Default.xex SHA-1
+# a942090b7c293d0ce63346ed8a2974448135d0dd: top of the loop in sub_8256CB80. r23, r24, r29
+# and r30 are the loop's invariants that game/tt2_frame.cpp needs to re-run a frame.
+[[midasm_hook]]
+name = "Tt2FrameBoundary"
+address = 0x8256CBE8
+registers = ["r23", "r24", "r29", "r30"]
+
+# The draw pass of each frame (sub_825D6E98 + sub_825D3AF0). Pages the main thread first
+# writes while drawing are presentation state for the render thread, not game state: rollback
+# leaves them alone (and re-simulated frames skip the draw pass).
+[[midasm_hook]]
+name = "Tt2DrawBegin"
+address = 0x8256CCB0
+
+[[midasm_hook]]
+name = "Tt2DrawEnd"
+address = 0x8256CCC0

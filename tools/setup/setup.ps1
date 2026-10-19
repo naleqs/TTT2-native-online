@@ -9,6 +9,9 @@
       2. verifies every game file against config/game_versions.json while copying it to native\game
       3. downloads a portable compiler toolchain into native\toolchain (hash-checked)
       4. builds the recompiler tools, translates Default.xex to C++ and compiles the game
+      5. installs your own DLC packages and title update from .\dlc (each 4 KB block is
+         checked against the package's hashes); a supported title update is applied to
+         Default.xex before it is translated
     Everything is written inside this folder. Nothing is installed on the system.
 
 .PARAMETER Image
@@ -38,6 +41,10 @@ $ToolDir = Join-Path $Native 'toolchain'
 $DownloadDir = Join-Path $Native 'downloads'
 $BinDir = Join-Path $Native 'bin'
 $LogFile = Join-Path $Native 'build.log'
+$ContentSource = Join-Path $Root 'dlc'
+$DlcDir = Join-Path $Native 'dlc'
+$UpdateDir = Join-Path $Native 'update'
+$TitleId = 0x4E4D0859   # Tekken Tag Tournament 2
 
 New-Item -ItemType Directory -Force -Path $Native | Out-Null
 
@@ -110,6 +117,7 @@ $versions = (Get-Content (Join-Path $Root 'config\game_versions.json') -Raw | Co
 $toolchain = Get-Content (Join-Path $Root 'config\toolchain.json') -Raw | ConvertFrom-Json
 
 Add-Type -Path (Join-Path $PSScriptRoot 'Xdvdfs.cs')
+Add-Type -Path (Join-Path $PSScriptRoot 'Stfs.cs')
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 Write-Host ''
@@ -291,11 +299,24 @@ function Invoke-Build {
     $ppc = Join-Path $recomp 'ppc'
     if (Test-Path $recomp) { Remove-Item $recomp -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $ppc | Out-Null
-    Copy-Item (Join-Path $GameDir 'Default.xex') (Join-Path $recomp 'default.xex')
+    $gameVersion = 'retail'
+    $hooks = 'tt2_hooks.toml'
+    if ($script:TitleUpdate) {
+        $tu = $script:TitleUpdate
+        Invoke-Native (Join-Path $toolsBuild 'tt2-xexpatch.exe') @((Join-Path $GameDir 'Default.xex'), (Join-Path $script:TitleUpdateDir 'Default.xexp'),
+            (Join-Path $recomp 'default.xex')) "Applying $($tu.name)"
+        $sha = (Get-FileHash (Join-Path $recomp 'default.xex') -Algorithm SHA1).Hash.ToLowerInvariant()
+        if ($sha -ne $tu.patched_xex_sha1) { Fail "Applying $($tu.name) gave an unexpected result. Remove it from the dlc folder and run setup again." }
+        $gameVersion = $tu.id
+        $hooks = $tu.hooks
+        Write-Log "Default.xex patched with $($tu.name)." 'Green'
+    } else {
+        Copy-Item (Join-Path $GameDir 'Default.xex') (Join-Path $recomp 'default.xex')
+    }
 
     Invoke-Native (Join-Path $toolsBuild 'tt2-analyze.exe') @((Join-Path $recomp 'default.xex'), $recomp) 'Analysing Default.xex'
     # Hand-maintained hooks (frame boundary, input, ...) go after the generated part.
-    Get-Content (Join-Path $Root 'config\recomp\tt2_hooks.toml') | Add-Content (Join-Path $recomp 'tt2_recomp.toml')
+    Get-Content (Join-Path $Root "config\recomp\$hooks") | Add-Content (Join-Path $recomp 'tt2_recomp.toml')
 
     $context = Get-Content (Join-Path $toolsBuild 'ppc_context_path.txt') -Raw
     Push-Location $recomp
@@ -308,8 +329,115 @@ function Invoke-Build {
     $gameBuild = Join-Path $BuildDir 'game'
     $simde = Join-Path (Split-Path (Split-Path $context.Trim() -Parent) -Parent) 'thirdparty\simde'
     Invoke-Native 'cmake' (@('-S', $Root, '-B', $gameBuild, '-DTT2_BUILD_GAME=ON', '-DTT2_BUILD_LAUNCHER=OFF', '-DTT2_BUILD_TESTS=OFF',
-        "-DTT2_RECOMP_DIR=$recomp", "-DTT2_SIMDE_DIR=$simde", "-DTT2_OUTPUT_DIR=$BinDir") + $common) 'Configuring the game build'
+        "-DTT2_RECOMP_DIR=$recomp", "-DTT2_SIMDE_DIR=$simde", "-DTT2_OUTPUT_DIR=$BinDir", "-DTT2_GAME_VERSION=$gameVersion") + $common) 'Configuring the game build'
     Invoke-Native 'cmake' @('--build', $gameBuild, '--target', 'tt2', '--parallel', "$Jobs") 'Compiling the game'
+}
+
+# ------------------------------------------------------------------------------ 5. DLC and title updates
+
+# Installs the player's own packages from .\dlc: DLC (marketplace content) is extracted into
+# native\dlc\<package>\ with an info.json the runtime reads; title updates are extracted into
+# native\update\<package>\ (applying them is a later step). Packages for other games and
+# other files are skipped. Unchanged packages are not extracted again.
+function Install-Content {
+    Write-Step 'Downloaded content (dlc folder)'
+    New-Item -ItemType Directory -Force -Path $DlcDir, $UpdateDir | Out-Null
+    $wanted = @{}
+    $files = @()
+    if (Test-Path $ContentSource) {
+        $files = @(Get-ChildItem $ContentSource -Recurse -File | Where-Object { $_.Name -ne 'README.txt' })
+    }
+    foreach ($f in $files) {
+        if (-not [TT2Setup.StfsPackage]::IsPackage($f.FullName)) { continue }
+        $pkg = $null
+        try {
+            $pkg = New-Object TT2Setup.StfsPackage $f.FullName
+            if ($pkg.TitleId -ne $TitleId) {
+                Write-Log ('  skipped (another game, title {0:X8}): {1}' -f $pkg.TitleId, $f.Name)
+                continue
+            }
+            $kind = switch ($pkg.ContentType) {
+                ([TT2Setup.StfsPackage]::ContentMarketplace) { 'dlc' }
+                ([TT2Setup.StfsPackage]::ContentTitleUpdate) { 'update' }
+                default { $null }
+            }
+            if (-not $kind) {
+                Write-Log ('  skipped (content type {0:X8}): {1}' -f $pkg.ContentType, $f.Name)
+                continue
+            }
+            $base = if ($kind -eq 'dlc') { $DlcDir } else { $UpdateDir }
+            $dest = Join-Path $base $f.Name
+            $wanted[$dest] = $true
+            $stamp = '{0}|{1}' -f $f.Length, $f.LastWriteTimeUtc.Ticks
+            $infoPath = Join-Path $dest 'info.json'
+            if ((Test-Path $infoPath) -and ((Get-Content $infoPath -Raw | ConvertFrom-Json).source -eq $stamp)) {
+                Write-Log "  up to date: $($pkg.DisplayName)"
+                continue
+            }
+
+            $total = [double]$pkg.TotalSize()
+            $script:done = 0.0
+            $label = $pkg.DisplayName
+            $progress = [Action[long]] {
+                param($n)
+                $script:done += $n
+                Write-Progress -Activity "Installing $label" -Status ('{0} of {1}' -f (Format-Size $script:done), (Format-Size $total)) `
+                    -PercentComplete ([int](100 * $script:done / [Math]::Max($total, 1)))
+            }
+            $tmp = "$dest.partial"
+            if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+            $pkg.ExtractAll($tmp, $progress)
+            Write-Progress -Activity "Installing $label" -Completed
+            [ordered]@{
+                display_name = $pkg.DisplayName
+                file_name = $f.Name
+                content_type = $pkg.ContentType
+                title_id = '{0:X8}' -f $pkg.TitleId
+                version = $pkg.Version
+                source = $stamp
+            } | ConvertTo-Json | Set-Content (Join-Path $tmp 'info.json') -Encoding UTF8
+            if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+            Move-Item $tmp $dest
+            Write-Log ("  installed {0}: {1} ({2})" -f $kind, $pkg.DisplayName, (Format-Size $total)) 'Green'
+        }
+        catch {
+            Write-Log "  skipped (damaged or unreadable): $($f.Name): $($_.Exception.Message)" 'Yellow'
+        }
+        finally {
+            if ($pkg) { $pkg.Dispose() }
+        }
+    }
+    # Packages that were removed from .\dlc are removed here too.
+    foreach ($dir in @(Get-ChildItem $DlcDir -Directory) + @(Get-ChildItem $UpdateDir -Directory)) {
+        if (-not $wanted[$dir.FullName]) {
+            Remove-Item $dir.FullName -Recurse -Force
+            Write-Log "  removed: $($dir.Name)"
+        }
+    }
+    $count = $wanted.Count
+    if ($count -eq 0) { Write-Log '  none (optional: put your own DLC and title update packages in the dlc folder)' }
+
+    # The title update to apply: the newest installed one this release supports (they are
+    # cumulative), identified by the SHA-1 of its Default.xexp.
+    $script:TitleUpdate = $null
+    $active = Join-Path $UpdateDir 'active.txt'
+    if (Test-Path $active) { Remove-Item $active -Force }
+    $supported = @($version.title_updates)
+    foreach ($dir in Get-ChildItem $UpdateDir -Directory) {
+        $xexp = Join-Path $dir.FullName 'Default.xexp'
+        if (-not (Test-Path $xexp)) { continue }
+        $sha = (Get-FileHash $xexp -Algorithm SHA1).Hash.ToLowerInvariant()
+        $tu = $supported | Where-Object { $_.xexp_sha1 -eq $sha } | Select-Object -First 1
+        if (-not $tu) { Write-Log "  not used: $($dir.Name) (an older or unknown title update; the newest one includes the earlier ones)"; continue }
+        if (-not $script:TitleUpdate -or [version]$tu.target_version -gt [version]$script:TitleUpdate.target_version) {
+            $script:TitleUpdate = $tu
+            $script:TitleUpdateDir = $dir.FullName
+        }
+    }
+    if ($script:TitleUpdate) {
+        Set-Content $active (Split-Path $script:TitleUpdateDir -Leaf) -Encoding ASCII
+        Write-Log "  using $($script:TitleUpdate.name)" 'Green'
+    }
 }
 
 # ------------------------------------------------------------------------------ run
@@ -331,14 +459,16 @@ try {
         if ($VerifyOnly) { Write-Log 'Verification passed.' 'Green'; return }
     }
 
+    Install-Content
     Initialize-Toolchain
     Invoke-Build
 
     # Netplay only connects players whose game data AND build are identical.
     $buildId = (Get-FileHash -InputStream ([IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes(
-        $version.default_xex_sha1 + (Get-Content (Join-Path $Root 'VERSION') -Raw).Trim() +
+        $version.default_xex_sha1 + $(if ($script:TitleUpdate) { $script:TitleUpdate.patched_xex_sha1 } else { '' }) +
+        (Get-Content (Join-Path $Root 'VERSION') -Raw).Trim() +
         ((Get-ChildItem (Join-Path $Root 'tools\recomp-patches') -Filter *.patch | Sort-Object Name | Get-FileHash).Hash -join '')))) -Algorithm SHA256).Hash.Substring(0, 16)
-    @{ version = $version.id; build_id = $buildId; built = (Get-Date -Format s) } | ConvertTo-Json |
+    @{ version = $version.id; title_update = $(if ($script:TitleUpdate) { $script:TitleUpdate.id } else { $null }); build_id = $buildId; built = (Get-Date -Format s) } | ConvertTo-Json |
         Set-Content (Join-Path $BinDir 'build-info.json') -Encoding UTF8
 
     $minutes = [int]((Get-Date) - $started).TotalMinutes

@@ -12,8 +12,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <mutex>
+#include <utility>
+#include <vector>
 
 namespace tt2
 {
@@ -35,6 +38,16 @@ namespace tt2
         uint64_t used() const;
         uint32_t begin() const { return begin_; }
         uint32_t end() const { return end_; }
+        // Live allocations (start, size).
+        std::vector<std::pair<uint32_t, uint32_t>> ranges() const;
+        // Called (under the allocator lock) after every successful allocation; rollback
+        // tracks new memory with it. Set it with set_on_alloc: other threads allocate meanwhile.
+        void set_on_alloc(std::function<void(uint32_t start, uint32_t size)> fn);
+
+    private:
+        std::function<void(uint32_t start, uint32_t size)> on_alloc;
+
+    public:
 
     private:
         uint32_t round(uint32_t v) const { return (v + granularity_ - 1) & ~(granularity_ - 1); }

@@ -55,6 +55,10 @@ namespace tt2::kernel
     {
         bool manual_reset;
         bool signaled;
+        // Pulses so far: a pulse releases whoever is waiting at that moment, then leaves the
+        // event unsignaled (NtPulseEvent), so waiters compare this against its value when
+        // they started waiting.
+        uint64_t pulses = 0;
         Event(bool manual, bool initial) : manual_reset(manual), signaled(initial) {}
         ObjectType type() const override { return ObjectType::Event; }
         bool is_signaled(uint32_t) const override { return signaled; }
@@ -125,12 +129,17 @@ namespace tt2::kernel
     // Waits. `timeout` is the NT 100 ns interval (negative = relative, positive = absolute
     // system time, null = infinite).
     std::optional<Clock::time_point> deadline_from_nt(const be<int64_t>* timeout);
-    uint32_t wait(const std::vector<std::shared_ptr<Object>>& objects, bool wait_all, std::optional<Clock::time_point> deadline, bool alertable);
+    // `before` runs under the wait lock before the first check: NtSignalAndWaitForSingleObjectEx
+    // signals there, so nothing can slip between its signal and its wait.
+    uint32_t wait(const std::vector<std::shared_ptr<Object>>& objects, bool wait_all, std::optional<Clock::time_point> deadline, bool alertable,
+                  const std::function<void()>& before = {});
 
     // Signal changes go through these so waiters wake up.
     void with_lock(const std::function<void()>& fn);
     std::mutex& wait_mutex();
     void notify_waiters();
+    // Blocks (under the wait mutex) until `ready` returns true; woken by notify_waiters().
+    void block_until(const std::function<bool()>& ready);
 
     uint32_t current_thread_id();
 }

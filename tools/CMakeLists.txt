@@ -1,4 +1,4 @@
-# Host tools for the first-time setup: XenonRecomp (patched) and tt2-analyze.
+# Host tools for the first-time setup: XenonRecomp (patched), tt2-analyze and tt2-xexpatch.
 # Built by tools/setup/setup.ps1 into native/build/tools.
 cmake_minimum_required(VERSION 3.20)
 project(tt2_tools C CXX)
@@ -32,6 +32,11 @@ FetchContent_MakeAvailable(xenonrecomp)
 add_executable(tt2-analyze tt2-analyze/main.cpp)
 target_compile_features(tt2-analyze PRIVATE cxx_std_20)
 target_link_libraries(tt2-analyze PRIVATE LibXenonAnalyse XenonUtils fmt::fmt)
+
+# Applies the player's own title update (Default.xexp) before analysis and recompilation.
+add_executable(tt2-xexpatch tt2-xexpatch/main.cpp)
+target_compile_features(tt2-xexpatch PRIVATE cxx_std_20)
+target_link_libraries(tt2-xexpatch PRIVATE XenonUtils)
 
 # The recompiler needs the path of ppc_context.h from the fetched sources.
 file(WRITE ${CMAKE_BINARY_DIR}/ppc_context_path.txt "${xenonrecomp_SOURCE_DIR}/XenonUtils/ppc_context.h")

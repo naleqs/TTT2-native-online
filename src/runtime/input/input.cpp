@@ -3,6 +3,10 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <vector>
+#include <string>
+#include <chrono>
+#include <cstdlib>
 #include <mutex>
 
 namespace tt2::input
@@ -16,6 +20,69 @@ namespace tt2::input
 
         constexpr int16_t kStickDeadzone = 7849;   // XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE
         constexpr uint8_t kTriggerThreshold = 30;  // XINPUT_GAMEPAD_TRIGGER_THRESHOLD
+
+        // TT2_DEBUG_KEYBOARD=1: the keyboard acts as player 1's pad, for driving the game from
+        // test scripts. Off by default; the game is played with controllers.
+        bool g_debug_keyboard = false;
+
+        // TT2_INPUT_SCRIPT=ms=button[,ms=button...]: press player 1's buttons (150 ms each) at
+        // fixed times after start, for unattended test runs. Buttons: a b x y start back up down
+        // left right lb rb.
+        struct ScriptedPress
+        {
+            int64_t at_ms;
+            uint16_t bit;
+        };
+        std::vector<ScriptedPress> g_script;
+        std::chrono::steady_clock::time_point g_start;
+
+        void load_script(const char* text)
+        {
+            using namespace netplay::button;
+            const std::pair<const char*, uint16_t> names[] = {
+                { "a", a }, { "b", b }, { "x", x }, { "y", y }, { "start", start }, { "back", back }, { "up", dpad_up },
+                { "down", dpad_down }, { "left", dpad_left }, { "right", dpad_right }, { "lb", left_shoulder }, { "rb", right_shoulder },
+            };
+            std::string spec(text);
+            size_t pos = 0;
+            while (pos < spec.size())
+            {
+                const size_t end = std::min(spec.find(',', pos), spec.size());
+                const std::string item = spec.substr(pos, end - pos);
+                const size_t eq = item.find('=');
+                if (eq != std::string::npos)
+                    for (auto& [name, bit] : names)
+                        if (item.substr(eq + 1) == name)
+                            g_script.push_back({ std::atoll(item.c_str()), bit });
+                pos = end + 1;
+            }
+            g_start = std::chrono::steady_clock::now();
+        }
+
+        void scripted(PadState& s)
+        {
+            const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_start).count();
+            for (const ScriptedPress& p : g_script)
+                if (now >= p.at_ms && now < p.at_ms + 150)
+                    s.buttons |= p.bit;
+            s.connected = true;
+        }
+
+        void debug_keyboard(PadState& s)
+        {
+            const bool* k = SDL_GetKeyboardState(nullptr);
+            using namespace netplay::button;
+            const struct { SDL_Scancode key; uint16_t bit; } map[] = {
+                { SDL_SCANCODE_UP, dpad_up }, { SDL_SCANCODE_DOWN, dpad_down }, { SDL_SCANCODE_LEFT, dpad_left },
+                { SDL_SCANCODE_RIGHT, dpad_right }, { SDL_SCANCODE_RETURN, start }, { SDL_SCANCODE_BACKSPACE, back },
+                { SDL_SCANCODE_Z, a }, { SDL_SCANCODE_X, b }, { SDL_SCANCODE_A, x }, { SDL_SCANCODE_S, y },
+                { SDL_SCANCODE_Q, left_shoulder }, { SDL_SCANCODE_W, right_shoulder },
+            };
+            for (const auto& m : map)
+                if (k[m.key])
+                    s.buttons |= m.bit;
+            s.connected = true;
+        }
 
         void refresh(int port)
         {
@@ -59,6 +126,10 @@ namespace tt2::input
                 s.rx = axis(SDL_GAMEPAD_AXIS_RIGHTX, false);
                 s.ry = axis(SDL_GAMEPAD_AXIS_RIGHTY, true);
             }
+            if (port == 0 && g_debug_keyboard)
+                debug_keyboard(s);
+            if (port == 0 && !g_script.empty())
+                scripted(s);
             g_state[port] = s;
         }
 
@@ -85,6 +156,10 @@ namespace tt2::input
     void init()
     {
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+        if (const char* v = std::getenv("TT2_DEBUG_KEYBOARD"); v && *v == '1')
+            g_debug_keyboard = true;
+        if (const char* v = std::getenv("TT2_INPUT_SCRIPT"); v && *v)
+            load_script(v);
         int count = 0;
         if (SDL_JoystickID* ids = SDL_GetGamepads(&count))
         {

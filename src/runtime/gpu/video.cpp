@@ -12,10 +12,14 @@
 #include "../kernel/threads.h"
 #include "../memory.h"
 #include "../netplay_glue.h"
+#include "../rollback/game_rollback.h"
+#include "capture.h"
+#include "renderer.h"
 
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <vector>
 
 using namespace tt2;
 using namespace tt2::kernel;
@@ -28,7 +32,8 @@ namespace tt2::video
         constexpr uint32_t REG_SCRATCH_UMSK = 0x01DC;
         constexpr uint32_t REG_SCRATCH_ADDR = 0x01DD;
         constexpr uint32_t REG_SCRATCH_REG0 = 0x0578;
-        constexpr uint32_t REG_COHER_STATUS_HOST = 0x0A2F;
+        constexpr uint32_t REG_COHER_STATUS_HOST = 0x0A31;
+        constexpr uint32_t kSwapMarker = 0x53574150; // 'SWAP' in the NOP that VdSwap writes
 
         std::atomic<uint32_t> g_ring_base{ 0 };  // physical
         std::atomic<uint32_t> g_ring_dwords{ 0 };
@@ -89,10 +94,24 @@ namespace tt2::video
             }
         }
 
-        void interrupt(uint32_t source)
+        // The callback reads the "current processor" from the PCR: the CP interrupt handler clears
+        // that processor's bit in a word the command stream then waits on, so it is delivered once
+        // per processor in the packet's mask, as if it ran there.
+        void interrupt(uint32_t source, uint32_t cpu_mask = 1)
         {
-            if (const uint32_t cb = g_interrupt_callback)
-                call_guest(cb, source, uint32_t(g_interrupt_data));
+            const uint32_t cb = g_interrupt_callback;
+            const auto self = kernel::current_thread();
+            if (!cb || !self)
+                return;
+            uint8_t& processor = g_base[self->pcr + 0x10C];
+            const uint8_t saved = processor;
+            for (uint32_t cpu = 0; cpu < 6; cpu++)
+                if (cpu_mask & (1u << cpu))
+                {
+                    processor = uint8_t(cpu);
+                    call_guest(cb, source, uint32_t(g_interrupt_data));
+                }
+            processor = saved;
         }
 
         bool compare(uint32_t function, uint32_t value, uint32_t ref)
@@ -126,6 +145,24 @@ namespace tt2::video
         };
 
         void execute(Reader& r, int depth);
+
+        // Vertical blank, 60 Hz. Raised from the GPU thread, also while the command processor
+        // waits: the swap path waits for the vblank handler to retire the previous flip.
+        std::chrono::steady_clock::time_point g_next_vblank;
+        void service_vblank()
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (now < g_next_vblank)
+                return;
+            g_next_vblank += std::chrono::microseconds(16667);
+            if (now - g_next_vblank > std::chrono::milliseconds(100))
+                g_next_vblank = now;
+            g_vblank_counter++;
+            interrupt(0);
+        }
+
+        // Waits are bounded so a value only a real GPU pipeline would produce cannot hang the game.
+        constexpr auto kWaitTimeout = std::chrono::milliseconds(100);
 
         void execute_type3(Reader& r, uint32_t header, int depth)
         {
@@ -162,7 +199,9 @@ namespace tt2::video
                 gpu_store(addr, (initiator >> 31) ? g_vblank_counter : value);
                 break;
             }
-            case 0x59: // EVENT_WRITE_EXT: initiator, address -> screen extents
+            case 0x59: // EVENT_WRITE_CFL
+                break;
+            case 0x5A: // EVENT_WRITE_EXT: initiator, address -> screen extents
             {
                 r.read();
                 const uint32_t addr = r.read();
@@ -178,7 +217,7 @@ namespace tt2::video
                 const uint32_t ref = r.read();
                 const uint32_t mask = r.read();
                 r.read();
-                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+                const auto deadline = std::chrono::steady_clock::now() + kWaitTimeout;
                 for (;;)
                 {
                     const uint32_t v = ((info & 0x10) ? gpu_load(poll) : reg(poll & 0xFFFF)) & mask;
@@ -186,9 +225,13 @@ namespace tt2::video
                         break;
                     if (std::chrono::steady_clock::now() > deadline)
                     {
-                        log("gpu: WAIT_REG_MEM on %08X timed out", poll);
+                        static uint32_t timeouts = 0;
+                        if (++timeouts <= 20 || timeouts % 1000 == 0)
+                            log("gpu: WAIT_REG_MEM #%u on %08X timed out (info %08X, value %08X, mask %08X, ref %08X)", timeouts, poll, info,
+                            (info & 0x10) ? gpu_load(poll) : reg(poll & 0xFFFF), mask, ref);
                         break;
                     }
+                    service_vblank();
                     std::this_thread::sleep_for(std::chrono::microseconds(50));
                 }
                 break;
@@ -224,11 +267,114 @@ namespace tt2::video
                 break;
             }
             case 0x54: // INTERRUPT
-                r.read();
-                interrupt(1);
+                interrupt(1, r.read());
                 break;
+            case 0x10: // NOP; VdSwap's marks the end of a frame
+                if (count >= 5 && r.read() == kSwapMarker)
+                {
+                    const uint32_t frontbuffer = r.read(), width = r.read(), height = r.read();
+                    gpu::on_frame_end();
+                    gpu::renderer::swap(frontbuffer, width, height);
+                }
+                break;
+            case 0x2D: // SET_CONSTANT: offset_type, values
+            {
+                const uint32_t offset_type = r.read();
+                const uint32_t index = offset_type & 0x7FF;
+                static constexpr uint32_t kBases[] = { 0x4000, 0x4800, 0x4900, 0x4908, 0x2000 };
+                const uint32_t type = (offset_type >> 16) & 0xFF;
+                if (type < 5)
+                    for (uint32_t i = 1; i < count; i++)
+                        write_register(kBases[type] + index + i - 1, r.read());
+                break;
+            }
+            case 0x55: // SET_CONSTANT2
+            case 0x56: // SET_SHADER_CONSTANTS
+            {
+                const uint32_t index = r.read() & 0xFFFF;
+                for (uint32_t i = 1; i < count; i++)
+                    write_register(index + i - 1, r.read());
+                break;
+            }
+            case 0x2F: // LOAD_ALU_CONSTANT: address, offset_type, size
+            {
+                const uint32_t address = guest_from_physical(r.read() & 0x3FFFFFFF);
+                const uint32_t offset_type = r.read();
+                const uint32_t size = r.read() & 0xFFF;
+                static constexpr uint32_t kBases[] = { 0x4000, 0x4800, 0x4900, 0x4908, 0x2000 };
+                const uint32_t type = (offset_type >> 16) & 0xFF;
+                if (type < 5)
+                    for (uint32_t i = 0; i < size; i++)
+                        write_register(kBases[type] + (offset_type & 0x7FF) + i, load32(address + i * 4));
+                break;
+            }
+            case 0x3E: // REG_TO_MEM: register, address
+            {
+                const uint32_t index = r.read() & 0xFFFF;
+                const uint32_t address = r.read();
+                gpu_store(address, reg(index));
+                break;
+            }
+            case 0x4F: // MEM_WRITE_CNTR: address
+                gpu_store(r.read(), g_vblank_counter);
+                break;
+            case 0x52: // WAIT_REG_EQ: register, value
+            case 0x53: // WAIT_REG_GTE
+            {
+                const uint32_t index = r.read() & 0xFFFF;
+                const uint32_t value = r.read();
+                const auto deadline = std::chrono::steady_clock::now() + kWaitTimeout;
+                while (g_running && std::chrono::steady_clock::now() < deadline &&
+                       !(opcode == 0x52 ? reg(index) == value : reg(index) >= value))
+                {
+                    service_vblank();
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                }
+                break;
+            }
+            case 0x27: // IM_LOAD: address | type, start << 16 | size
+            {
+                const uint32_t addr_type = r.read();
+                const uint32_t size = r.read() & 0xFFFF;
+                const uint32_t address = guest_from_physical(addr_type & ~3u);
+                gpu::on_shader_load(addr_type & 3, reinterpret_cast<const uint32_t*>(g_base + address), size);
+                gpu::renderer::load_shader(addr_type & 3, reinterpret_cast<const uint32_t*>(g_base + address), size);
+                break;
+            }
+            case 0x2B: // IM_LOAD_IMMEDIATE: type, start << 16 | size, words
+            {
+                const uint32_t type = r.read();
+                const uint32_t size = r.read() & 0xFFFF;
+                std::vector<uint32_t> words;
+                for (uint32_t i = 0; i < size && i + 2 < count; i++)
+                    words.push_back(__builtin_bswap32(r.read()));
+                gpu::on_shader_load(type & 3, words.data(), uint32_t(words.size()));
+                gpu::renderer::load_shader(type & 3, words.data(), uint32_t(words.size()));
+                break;
+            }
+            case 0x22: // DRAW_INDX: viz token, initiator, [index base, index size]
+            {
+                r.read();
+                const uint32_t initiator = r.read();
+                uint32_t index_base = 0, index_size = 0;
+                if (((initiator >> 6) & 3) == 0 && count >= 4)
+                {
+                    index_base = r.read();
+                    index_size = r.read();
+                }
+                gpu::on_draw(initiator);
+                gpu::renderer::draw(initiator, index_base, index_size);
+                break;
+            }
+            case 0x36: // DRAW_INDX_2: initiator, [immediate indices]
+            {
+                const uint32_t initiator = r.read();
+                gpu::on_draw(initiator);
+                gpu::renderer::draw(initiator, 0, 0);
+                break;
+            }
             default:
-                break; // draws, constants, state: rendering is not implemented
+                break; // other state: not needed without a renderer
             }
             r.pos = next;
         }
@@ -268,7 +414,7 @@ namespace tt2::video
         void gpu_thread()
         {
             adopt_host_thread("gpu");
-            auto next_vblank = std::chrono::steady_clock::now();
+            g_next_vblank = std::chrono::steady_clock::now();
             while (g_running)
             {
                 const uint32_t ring = g_ring_base, dwords = g_ring_dwords;
@@ -285,15 +431,7 @@ namespace tt2::video
                     }
                 }
 
-                const auto now = std::chrono::steady_clock::now();
-                if (now >= next_vblank)
-                {
-                    next_vblank += std::chrono::microseconds(16667);
-                    if (now - next_vblank > std::chrono::milliseconds(100))
-                        next_vblank = now;
-                    g_vblank_counter++;
-                    interrupt(0);
-                }
+                service_vblank();
                 std::this_thread::sleep_for(std::chrono::microseconds(250));
             }
         }
@@ -303,6 +441,15 @@ namespace tt2::video
     {
         if (g_running.exchange(true))
             return;
+        gpu::configure();
+        // Registers the D3D library reads instead of writes (values from Xenia's
+        // GraphicsSystem::ReadRegister). The interrupt callback checks the interrupt status to
+        // tell a vblank apart from other sources; with 0 it ignores every interrupt.
+        set_reg(0x0F00, 0x08100748); // RB_EDRAM_TIMING
+        set_reg(0x0F01, 0x0000200E); // RB_BC_CONTROL
+        set_reg(0x194C, 0x000002D0); // D1MODE_V_COUNTER
+        set_reg(0x1951, 0x00000001); // interrupt status: vblank
+        set_reg(0x1961, 0x050002D0); // D1MODE_VIEWPORT_SIZE (1280x720)
         g_thread = std::thread(gpu_thread);
     }
 
@@ -315,6 +462,12 @@ namespace tt2::video
     }
 
     uint64_t frames() { return g_frames; }
+
+    std::pair<uint32_t, uint32_t> ring_range()
+    {
+        const uint32_t ring = g_ring_base;
+        return ring ? std::make_pair(guest_from_physical(ring), uint32_t(g_ring_dwords) * 4) : std::make_pair(0u, 0u);
+    }
 }
 
 using namespace tt2::video;
@@ -342,19 +495,30 @@ TT2_IMPORT(VdEnableRingBufferRPtrWriteBack)
     g_rptr_writeback = ctx.r3.u32;
 }
 
+// VdGetSystemCommandBuffer(p0, p1): p0 is a 0x94-byte block filled in place (as Xenia does).
 TT2_IMPORT(VdGetSystemCommandBuffer)
 {
-    static uint32_t buffer = 0;
-    if (!buffer)
-        buffer = g_memory.physical.alloc(0x10000, 0x1000);
-    if (ctx.r3.u32)
-        store32(ctx.r3.u32, buffer);
+    if (const uint32_t p0 = ctx.r3.u32)
+    {
+        std::memset(g_base + p0, 0, 0x94);
+        store32(p0, 0xBEEF0000);
+    }
     if (ctx.r4.u32)
-        store32(ctx.r4.u32, 0xBEEF0000);
+        store32(ctx.r4.u32, 0xBEEF0001);
 }
 
 TT2_IMPORT(VdSetSystemCommandBufferGpuIdentifierAddress) {}
-TT2_IMPORT(VdInitializeScalerCommandBuffer) { ctx.r3.u64 = 0; }
+
+// VdInitializeScalerCommandBuffer(..., dest_ptr (arg 10), dest_count (arg 11)): the library runs
+// this buffer on the GPU, so it must hold valid packets: fill it with NOPs, return its length.
+TT2_IMPORT(VdInitializeScalerCommandBuffer)
+{
+    Args a{ ctx };
+    const uint32_t dest = a.u32(10), count = a.u32(11);
+    for (uint32_t i = 0; dest && i < count; i++)
+        store32(dest + i * 4, 0x80000000);
+    a.ret(count);
+}
 TT2_IMPORT(VdQueryVideoFlags) { ctx.r3.u64 = 0x7; } // widescreen, 720p, 1080i capable
 
 TT2_IMPORT(VdQueryVideoMode)
@@ -403,10 +567,27 @@ TT2_IMPORT(VdSwap)
     if (const uint32_t buffer = ctx.r3.u32)
     {
         store32(buffer, (3u << 30) | (62u << 16) | (0x10u << 8)); // type 3 NOP, 63 dwords follow
-        for (uint32_t i = 1; i < 64; i++)
+        store32(buffer + 4, kSwapMarker);                           // end of frame, for the GPU thread
+        // The front buffer, from its texture fetch constant (second argument).
+        uint32_t frontbuffer = 0, width = 0, height = 0;
+        if (const uint32_t fetch = ctx.r4.u32)
+        {
+            frontbuffer = load32(fetch + 4) & 0xFFFFF000;
+            const uint32_t size = load32(fetch + 8);
+            width = (size & 0x1FFF) + 1;
+            height = ((size >> 13) & 0x1FFF) + 1;
+        }
+        store32(buffer + 8, frontbuffer);
+        store32(buffer + 12, width);
+        store32(buffer + 16, height);
+        for (uint32_t i = 5; i < 64; i++)
             store32(buffer + i * 4, 0);
     }
-    g_frames++;
-    netglue::on_present();
+    // Re-simulated rollback frames are not presented.
+    if (!rollback::resimulating())
+    {
+        g_frames++;
+        netglue::on_present();
+    }
     ctx.r3.u64 = 0;
 }

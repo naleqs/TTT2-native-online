@@ -8,8 +8,14 @@
 #include "../netplay_glue.h"
 #include "../input/input.h"
 
+#include <cstring>
 #include <deque>
+#include <mutex>
+#include <chrono>
 #include <filesystem>
+#include <fstream>
+
+#include <nlohmann/json.hpp>
 
 namespace fs = std::filesystem;
 using namespace tt2;
@@ -25,6 +31,8 @@ namespace
     constexpr uint32_t kTitleId = 0x54656B6B;
     constexpr uint32_t ERROR_EMPTY = 4306;
     constexpr uint32_t ERROR_NOT_FOUND = 1168;
+    constexpr uint32_t ERROR_INSUFFICIENT_BUFFER = 122;
+    constexpr uint32_t ERROR_NOT_LOGGED_ON = 1245;
     constexpr uint64_t kXuidBase = 0xE000000054543200ull; // offline XUIDs
 
     // XOVERLAPPED: +0 result, +4 length, +8 context, +C event, +10 completion routine,
@@ -103,8 +111,13 @@ TT2_IMPORT(XamInputGetState)
         return a.ret(win32::device_not_connected);
     if (state)
     {
-        static std::atomic<uint32_t> packet{ 1 };
-        store32(state, packet++);
+        // XInput only changes the packet number when the state changes. Deriving it from the
+        // state keeps it deterministic, so a re-simulated frame reads exactly what the original did.
+        uint32_t packet = 2166136261u;
+        for (uint32_t v : { uint32_t(s.buttons), uint32_t(s.left_trigger) << 8 | s.right_trigger, uint32_t(uint16_t(s.lx)) << 16 | uint16_t(s.ly),
+                            uint32_t(uint16_t(s.rx)) << 16 | uint16_t(s.ry) })
+            packet = (packet ^ v) * 16777619u;
+        store32(state, packet | 1);
         store16(state + 4, s.buttons);
         g_base[state + 6] = s.left_trigger;
         g_base[state + 7] = s.right_trigger;
@@ -152,9 +165,102 @@ TT2_IMPORT(XamInputGetCapabilities)
     a.ret(win32::success);
 }
 
+// XInputGetKeystroke reports pad buttons as virtual keys (VK_PAD_*); the game's menus confirm
+// and cancel with them. Events come from changes in the same per-frame pad state that
+// XamInputGetState returns, with key repeat for held buttons (as on the console: 400 ms, then
+// every 100 ms). There is no keyboard.
+namespace
+{
+    struct KeystrokeQueue
+    {
+        uint16_t previous = 0;
+        uint8_t previous_triggers = 0; // bit 0 left, bit 1 right
+        std::deque<std::pair<uint16_t, uint16_t>> events; // virtual key, flags
+        uint16_t repeat_key = 0;
+        std::chrono::steady_clock::time_point repeat_at;
+    };
+    KeystrokeQueue g_keys[4];
+    std::mutex g_keys_mutex;
+
+    constexpr uint16_t XINPUT_KEYSTROKE_KEYDOWN = 1, XINPUT_KEYSTROKE_KEYUP = 2, XINPUT_KEYSTROKE_REPEAT = 4;
+
+    void poll_keystrokes(uint32_t user, const input::PadState& s)
+    {
+        static const std::pair<uint16_t, uint16_t> buttons[] = {
+            { 0x1000, 0x5800 }, { 0x2000, 0x5801 }, { 0x4000, 0x5802 }, { 0x8000, 0x5803 }, // A B X Y
+            { 0x0200, 0x5804 }, { 0x0100, 0x5805 },                                           // RB LB
+            { 0x0001, 0x5810 }, { 0x0002, 0x5811 }, { 0x0004, 0x5812 }, { 0x0008, 0x5813 }, // d-pad
+            { 0x0010, 0x5814 }, { 0x0020, 0x5815 }, { 0x0040, 0x5816 }, { 0x0080, 0x5817 }, // start back thumbs
+        };
+        KeystrokeQueue& q = g_keys[user];
+        const auto now = std::chrono::steady_clock::now();
+        const uint8_t triggers = uint8_t((s.left_trigger > 30 ? 1 : 0) | (s.right_trigger > 30 ? 2 : 0));
+        auto change = [&](bool was, bool is, uint16_t vk) {
+            if (is && !was)
+            {
+                q.events.push_back({ vk, XINPUT_KEYSTROKE_KEYDOWN });
+                q.repeat_key = vk;
+                q.repeat_at = now + std::chrono::milliseconds(400);
+            }
+            else if (!is && was)
+            {
+                q.events.push_back({ vk, XINPUT_KEYSTROKE_KEYUP });
+                if (q.repeat_key == vk)
+                    q.repeat_key = 0;
+            }
+        };
+        for (auto [bit, vk] : buttons)
+            change(q.previous & bit, s.buttons & bit, vk);
+        change(q.previous_triggers & 1, triggers & 1, 0x5806);
+        change(q.previous_triggers & 2, triggers & 2, 0x5807);
+        q.previous = s.buttons;
+        q.previous_triggers = triggers;
+        if (q.repeat_key && now >= q.repeat_at && q.events.empty())
+        {
+            q.events.push_back({ q.repeat_key, XINPUT_KEYSTROKE_KEYDOWN | XINPUT_KEYSTROKE_REPEAT });
+            q.repeat_at = now + std::chrono::milliseconds(100);
+        }
+    }
+}
+
+// XamInputGetKeystrokeEx(user_index* (0xFF: any), flags, XINPUT_KEYSTROKE*)
+// XINPUT_KEYSTROKE: be16 virtual key, be16 unicode, be16 flags, u8 user index, u8 hid code
 TT2_IMPORT(XamInputGetKeystrokeEx)
 {
-    ctx.r3.u64 = ERROR_EMPTY; // controller-only port: no keyboard
+    Args a{ ctx };
+    const uint32_t user_ptr = a.u32(0), out = a.u32(2);
+    const uint32_t requested = user_ptr ? load32(user_ptr) : 0;
+    std::lock_guard lock(g_keys_mutex);
+    bool any_connected = false;
+    for (uint32_t user = 0; user < 4; user++)
+    {
+        if (requested != 0xFF && requested != user)
+            continue;
+        input::PadState s;
+        if (!netglue::input_for_port(int(user), s))
+            s = input::read(int(user));
+        if (!s.connected)
+            continue;
+        any_connected = true;
+        poll_keystrokes(user, s);
+        KeystrokeQueue& q = g_keys[user];
+        if (q.events.empty())
+            continue;
+        const auto [vk, flags] = q.events.front();
+        q.events.pop_front();
+        if (out)
+        {
+            store16(out + 0, vk);
+            store16(out + 2, 0);
+            store16(out + 4, flags);
+            g_base[out + 6] = uint8_t(user);
+            g_base[out + 7] = 0;
+        }
+        if (user_ptr)
+            store32(user_ptr, user);
+        return a.ret(win32::success);
+    }
+    a.ret(any_connected ? ERROR_EMPTY : win32::device_not_connected);
 }
 
 // ---------------------------------------------------------------------- users
@@ -228,11 +334,59 @@ TT2_IMPORT(XamUserGetOnlineCountryFromXUID) { ctx.r3.u64 = 103; } // United Stat
 
 // XamUserReadProfileSettings(title, user, xuid_count, xuids, setting_count, setting_ids,
 //                            buffer_size*, buffer, overlapped)
+//
+// No profile settings are stored, so every requested setting comes back as "default" (from = 0)
+// with an empty value of the setting's type, and the game uses its own defaults. Like the
+// console, a call without a big enough buffer only reports the size needed.
+// Result: be32 count, be32 settings pointer, then count X_USER_PROFILE_SETTING (40 bytes: from,
+// pad, user index / xuid, setting id, pad, X_USER_DATA {type, pad, value or {length, pointer}}),
+// then the space for binary values.
 TT2_IMPORT(XamUserReadProfileSettings)
 {
     Args a{ ctx };
-    // No profile settings are stored: the game falls back to its defaults.
-    a.ret(complete(a.u32(8), ERROR_NOT_FOUND));
+    const uint32_t user = a.u32(1), count = a.u32(4), ids = a.u32(5), size_ptr = a.u32(6), buffer = a.u32(7);
+    if (a.u32(2) == 0 && !user_present(user))
+    {
+        a.ret(complete(a.u32(8), ERROR_NOT_LOGGED_ON));
+        return;
+    }
+    auto binary_size = [](uint32_t id) { return (id >> 16) & 0xFFF; };
+    uint32_t needed = 8 + count * 40;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        const uint32_t id = load32(ids + i * 4);
+        if (((id >> 28) & 0xF) == 6 || ((id >> 28) & 0xF) == 4) // binary, unicode string
+            needed += (binary_size(id) + 3) & ~3u;
+    }
+    const uint32_t available = size_ptr ? load32(size_ptr) : 0;
+    if (size_ptr)
+        store32(size_ptr, needed);
+    if (!buffer || available < needed)
+    {
+        a.ret(ERROR_INSUFFICIENT_BUFFER);
+        return;
+    }
+    std::memset(g_base + buffer, 0, needed);
+    store32(buffer + 0, count);
+    store32(buffer + 4, buffer + 8);
+    uint32_t extra = buffer + 8 + count * 40;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        const uint32_t id = load32(ids + i * 4);
+        const uint32_t s = buffer + 8 + i * 40;
+        const uint32_t type = (id >> 28) & 0xF;
+        store32(s + 0, 0);      // from: default
+        store32(s + 8, user);   // user index
+        store32(s + 16, id);
+        g_base[s + 24] = uint8_t(type);
+        if (type == 6 || type == 4)
+        {
+            store32(s + 32, 0); // length
+            store32(s + 36, extra);
+            extra += (binary_size(id) + 3) & ~3u;
+        }
+    }
+    a.ret(complete(a.u32(8), win32::success));
 }
 
 TT2_IMPORT(XamUserGetDeviceContext)
@@ -243,12 +397,15 @@ TT2_IMPORT(XamUserGetDeviceContext)
     a.ret(user_present(a.u32(0)) ? win32::success : win32::device_not_connected);
 }
 
+// XamUserCreateAchievementEnumerator(title, user, xuid, detail_flags, start, count, buffer_size*, handle*)
+// The buffer size is count entries of a full XACHIEVEMENT_DETAILS with its strings (500 bytes
+// each); TTT2 asserts on exactly that. No achievements are enumerated.
 TT2_IMPORT(XamUserCreateAchievementEnumerator)
 {
     Args a{ ctx };
     auto e = std::make_shared<Enumerator>();
     if (auto* size = a.ptr<be<uint32_t>>(6))
-        *size = 0x100;
+        *size = a.u32(5) * 500;
     if (auto* h = a.ptr<be<uint32_t>>(7))
         *h = create_handle(e);
     a.ret(win32::success);
@@ -301,6 +458,54 @@ TT2_IMPORT(XamGetPrivateEnumStructureFromHandle) { ctx.r3.u64 = status::unsucces
 
 // ---------------------------------------------------------------------- content (saves)
 
+// DLC (marketplace content, type 2): the player's own packages, which setup verifies and
+// extracts into native\dlc\<package file name>\ with an info.json. Each holds an index.dat
+// and the data archive the game loads from it (DLCDATnnn:\dataNNN.dat). They are reported as
+// installed and mounted read-only when the game opens them. TT2_DLC=0 hides them.
+namespace
+{
+    constexpr uint32_t XCONTENTTYPE_MARKETPLACE = 2;
+
+    struct DlcPackage
+    {
+        std::string file_name;    // the package's name, XCONTENT_DATA.FileName
+        std::string display_name;
+        fs::path dir;
+    };
+
+    const std::vector<DlcPackage>& installed_dlc()
+    {
+        static const std::vector<DlcPackage> packages = [] {
+            std::vector<DlcPackage> list;
+            if (const char* v = std::getenv("TT2_DLC"); v && *v == '0')
+                return list;
+            std::error_code ec;
+            const fs::path root = xam::g_save_root.parent_path() / "dlc";
+            for (auto& d : fs::directory_iterator(root, ec))
+            {
+                const fs::path info = d.path() / "info.json";
+                if (!d.is_directory() || !fs::exists(info, ec))
+                    continue;
+                try
+                {
+                    const auto j = nlohmann::json::parse(std::ifstream(info));
+                    DlcPackage pkg{ j.at("file_name").get<std::string>(), j.value("display_name", std::string()), d.path() };
+                    if (pkg.file_name.size() > 42)
+                        continue;
+                    log("xam: DLC installed: %s", pkg.display_name.c_str());
+                    list.push_back(std::move(pkg));
+                }
+                catch (const std::exception& e)
+                {
+                    log("xam: ignoring %s: %s", info.string().c_str(), e.what());
+                }
+            }
+            return list;
+        }();
+        return packages;
+    }
+}
+
 // XamContentCreateEx(user, root_name, content_data, flags, disposition*, license*,
 //                    cache_size, content_size, overlapped)
 TT2_IMPORT(XamContentCreateEx)
@@ -309,6 +514,25 @@ TT2_IMPORT(XamContentCreateEx)
     const std::string root = reinterpret_cast<const char*>(g_base + a.u32(1));
     const std::string file = content_filename(a.u32(2));
     const uint32_t flags = a.u32(3);
+    // XCONTENT_DATA: be32 device, be32 content type, ... Saved games (type 1) and installed DLC.
+    if (a.u32(2) && load32(a.u32(2) + 4) == XCONTENTTYPE_MARKETPLACE)
+    {
+        const DlcPackage* pkg = nullptr;
+        for (const DlcPackage& d : installed_dlc())
+            if (d.file_name == file)
+                pkg = &d;
+        if (!pkg)
+            return a.ret(complete(a.u32(8), win32::file_not_found));
+        io::mount("\\device\\content\\" + root, pkg->dir, true);
+        io::link(root + ":", "\\device\\content\\" + root);
+        if (auto* d = a.ptr<be<uint32_t>>(4))
+            *d = 2; // XCONTENT_EXISTING
+        if (auto* l = a.ptr<be<uint32_t>>(5))
+            *l = 0xFFFFFFFF; // licensed
+        return a.ret(complete(a.u32(8), win32::success));
+    }
+    if (a.u32(2) && load32(a.u32(2) + 4) != 1)
+        return a.ret(complete(a.u32(8), win32::file_not_found));
     const fs::path dir = xam::g_save_root / (file.empty() ? "content" : file);
     std::error_code ec;
     const bool exists = fs::exists(dir, ec);
@@ -367,13 +591,39 @@ TT2_IMPORT(XamContentGetDeviceState)
 }
 
 // XamContentCreateEnumerator(user, device, content_type, flags, items, buffer_size*, handle*)
+// Only saved games (content type 1) exist: they are the folders in native\save. Anything else,
+// such as marketplace content (type 2, the DLC characters' unlock packages), enumerates as
+// nothing installed. Reporting the save folders for every type made the game load the save
+// data as DLC packages.
 TT2_IMPORT(XamContentCreateEnumerator)
 {
     Args a{ ctx };
     auto e = std::make_shared<Enumerator>();
     e->item_size = 0x134;
     std::error_code ec;
-    if (fs::exists(xam::g_save_root, ec))
+    constexpr uint32_t XCONTENTTYPE_SAVEDGAME = 1;
+    // Installed DLC is device content: listed once, for the first user's enumeration (the game
+    // enumerates users 0-3 and would see every package four times).
+    if (a.u32(2) == XCONTENTTYPE_MARKETPLACE && a.u32(0) == 0)
+        for (const DlcPackage& pkg : installed_dlc())
+        {
+            std::vector<uint8_t> item(0x134, 0);
+            auto put32 = [&](size_t off, uint32_t v) {
+                v = byteswap(v);
+                std::memcpy(item.data() + off, &v, 4);
+            };
+            put32(0, 1); // device: HDD
+            put32(4, XCONTENTTYPE_MARKETPLACE);
+            const auto name = widen(pkg.display_name);
+            for (size_t i = 0; i < name.size() && i < 127; i++)
+            {
+                const uint16_t c = byteswap(uint16_t(name[i]));
+                std::memcpy(item.data() + 8 + i * 2, &c, 2);
+            }
+            std::memcpy(item.data() + 8 + 256, pkg.file_name.data(), pkg.file_name.size());
+            e->items.push_back(std::move(item));
+        }
+    if (a.u32(2) == XCONTENTTYPE_SAVEDGAME && fs::exists(xam::g_save_root, ec))
     {
         for (auto& d : fs::directory_iterator(xam::g_save_root, ec))
         {
@@ -560,16 +810,66 @@ TT2_IMPORT(XNetLogonGetTitleID) { ctx.r3.u64 = kTitleId; }
 
 // ---------------------------------------------------------------------- XMsg / sessions / voice
 
-TT2_IMPORT(XMsgInProcessCall) { ctx.r3.u64 = 0x80004005; }
+namespace
+{
+    constexpr uint32_t kXmpApp = 0xFA; // background music player ("XMP")
+    constexpr uint32_t X_E_FAIL = 0x80004005;
+
+    // XMP messages, following Xenia's xmp_app.cc. The argument block starts with the XMP
+    // client id, followed by pointers to the outputs. No user music is ever playing: the
+    // game owns playback.
+    uint32_t xmp_message(uint32_t message, uint32_t args)
+    {
+        auto out32 = [&](int index, uint32_t value) {
+            if (args)
+                if (const uint32_t p = load32(args + index * 4))
+                    store32(p, value);
+        };
+        switch (message)
+        {
+        case 0x00070009: out32(1, 0); return 0;                                // XMPGetStatus: idle
+        case 0x0007000B: out32(1, std::bit_cast<uint32_t>(1.0f)); return 0;    // XMPGetVolume
+        case 0x0007001B: out32(1, 1); out32(2, 0); return 0;                   // XMPGetPlaybackController: title, not locked
+        case 0x00070029: out32(1, 0); out32(2, 0); out32(3, 0); return 0;      // XMPGetPlaybackBehavior
+        case 0x00070053: out32(1, 0); return 0;                                // XMPGetDashInitState
+        case 0x00070002: case 0x00070003: case 0x00070004: case 0x00070005:     // play/continue/stop/pause
+        case 0x00070006: case 0x00070007: case 0x00070008: case 0x0007000C:     // next/prev/behavior/volume
+        case 0x0007001A: case 0x00070013: case 0x0007003D:
+            return 0;
+        default:
+            log("xam: XMP message %08X not implemented", message);
+            return X_E_FAIL;
+        }
+    }
+
+    uint32_t dispatch_message(uint32_t app, uint32_t message, uint32_t args)
+    {
+        if (app == kXmpApp)
+            return xmp_message(message, args);
+        log("xam: message %08X for app %02X not implemented", message, app);
+        return X_E_FAIL;
+    }
+}
+
+// XMsgInProcessCall(app, message, param1, param2)
+TT2_IMPORT(XMsgInProcessCall)
+{
+    Args a{ ctx };
+    a.ret(dispatch_message(a.u32(0), a.u32(1), a.u32(2)));
+}
+
+// XMsgStartIORequest(app, message, overlapped, buffer, buffer_size)
 TT2_IMPORT(XMsgStartIORequest)
 {
     Args a{ ctx };
-    a.ret(complete(a.u32(2), 0x80004005));
+    a.ret(complete(a.u32(2), dispatch_message(a.u32(0), a.u32(1), a.u32(3))));
 }
+
+// XMsgStartIORequestEx(app, message, overlapped, buffer, buffer_size, unknown)
 TT2_IMPORT(XMsgStartIORequestEx)
 {
     Args a{ ctx };
-    a.ret(complete(a.u32(2), 0x80004005));
+    a.ret(complete(a.u32(2), dispatch_message(a.u32(0), a.u32(1), a.u32(3))));
 }
 TT2_IMPORT(XMsgCancelIORequest) { ctx.r3.u64 = 0; }
 TT2_IMPORT(XamSessionCreateHandle) { ctx.r3.u64 = 0x80004005; }
@@ -579,5 +879,21 @@ TT2_IMPORT(XamVoiceClose) { ctx.r3.u64 = 0; }
 TT2_IMPORT(XamVoiceHeadsetPresent) { ctx.r3.u64 = 0; }
 TT2_IMPORT(XamVoiceIsActiveProcess) { ctx.r3.u64 = 0; }
 TT2_IMPORT(XamVoiceSubmitPacket) { ctx.r3.u64 = win32::device_not_connected; }
-TT2_IMPORT(XamParseGamerTileKey) { ctx.r3.u64 = win32::function_failed; }
-TT2_IMPORT(XamReadTileToTexture) { ctx.r3.u64 = win32::function_failed; }
+// Gamer pictures: there are none. The key parses to tile 0 and reading a tile succeeds without
+// drawing anything (as in Xenia); failing makes the game retry every frame.
+// XamParseGamerTileKey(key, title_id*, big_tile_id*, small_tile_id*)
+TT2_IMPORT(XamParseGamerTileKey)
+{
+    Args a{ ctx };
+    for (int i = 1; i <= 3; i++)
+        if (auto* p = a.ptr<be<uint32_t>>(i))
+            *p = 0;
+    a.ret(win32::success);
+}
+
+// XamReadTileToTexture(type, title_id, tile_id, user, buffer, stride, height, overlapped)
+TT2_IMPORT(XamReadTileToTexture)
+{
+    Args a{ ctx };
+    a.ret(complete(a.u32(7), win32::success));
+}

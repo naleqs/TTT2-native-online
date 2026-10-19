@@ -12,6 +12,17 @@
         "_note": "Redump-verified dump. A matching image skips the per-file check."
       },
       "default_xex_sha1": "a942090b7c293d0ce63346ed8a2974448135d0dd",
+      "title_updates": [
+        {
+          "id": "tu3",
+          "name": "Title Update 3 (0.0.3.2)",
+          "target_version": "0.0.3.2",
+          "xexp_sha1": "d3d37636693c0ecf191133b1d322026a22a3250a",
+          "patched_xex_sha1": "04b49c51f5358f9ce6cdb7d04d50aa05722a5465",
+          "hooks": "tt2_hooks_tu3.toml",
+          "_note": "Cumulative: also contains Title Updates 1 and 2. Only the newest update is supported."
+        }
+      ],
       "files": {
         "AvatarAssetPack": {
           "sha1": "214db560de3422182284ed5c82a3f94e55936ebc",

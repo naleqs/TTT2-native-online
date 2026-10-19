@@ -2,12 +2,9 @@
 
 // Connects the rollback session to the running game.
 //
-// Frame boundary: the first read of controller port 0 after each presented frame, the same
-// point Tekken6-rollback uses on the PS3 version (its cellPadGetData hook). Until the game's
-// main-loop function is located (config/recomp/tt2_hooks.toml), frames cannot be re-run, so
-// the session runs with a prediction window of 0: classic delay-based lockstep with the
-// automatic input delay. With the hook in place the same session switches on rollback,
-// using rollback/snapshot.h for the state.
+// The frame boundary is the top of the game's main loop (Tt2FrameBoundary hook, see
+// game/tt2_frame.cpp); rollback/game_rollback.cpp runs the session there, restores snapshots
+// and re-runs frames on mispredictions.
 
 #include "input/input.h"
 

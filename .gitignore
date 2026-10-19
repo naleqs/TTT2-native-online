@@ -10,6 +10,8 @@
 *.stfs
 iso/*
 !iso/README.txt
+dlc/*
+!dlc/README.txt
 
 # Everything the first-time setup creates (extracted disc, recompiled
 # code, compiled game, downloaded toolchain, logs)

@@ -11,7 +11,10 @@
 #include "image.h"
 #include "memory.h"
 #include "netplay_glue.h"
+#include "rollback/game_rollback.h"
 #include "audio/audio.h"
+#include "gpu/capture.h"
+#include "gpu/renderer.h"
 #include "gpu/video.h"
 #include "input/input.h"
 #include "kernel/io.h"
@@ -49,6 +52,7 @@ namespace tt2
     {
         std::vector<std::string> g_trace_filter; // empty = every import
         bool g_trace_stack = false;
+        uint32_t g_trace_r3 = 0;                 // TT2_TRACE_R3: only calls whose first argument matches
     }
 
     // The game's code saves return addresses on the guest stack as on the console
@@ -75,6 +79,8 @@ namespace tt2
     void trace_import(const char* name, const PPCContext& ctx)
     {
         if (!g_trace_filter.empty() && std::find(g_trace_filter.begin(), g_trace_filter.end(), name) == g_trace_filter.end())
+            return;
+        if (g_trace_r3 && ctx.r3.u32 != g_trace_r3)
             return;
         const auto t = kernel::current_thread();
         log("[t%u] %s(%08X, %08X, %08X, %08X) lr=%08llX%s%s", t ? t->id : 0, name, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
@@ -147,10 +153,11 @@ namespace
         const bool in_guest = g_base && addr >= uintptr_t(g_base) && addr < uintptr_t(g_base) + PPC_MEMORY_SIZE;
         const auto thread = kernel::current_thread();
         PPCContext* ctx = current_context();
-        log("CRASH: exception %08lX at host %p, %s address %08llX, guest thread %u, lr %08llX r1 %08X",
-            code, info->ExceptionRecord->ExceptionAddress, in_guest ? "guest" : "host",
+        log("CRASH: exception %08lX at host %p (in sub_%08X), %s address %08llX, guest thread %u, lr %08llX r1 %08X, stack:%s",
+            code, info->ExceptionRecord->ExceptionAddress, kernel::guest_function_at(uintptr_t(info->ExceptionRecord->ExceptionAddress)),
+            in_guest ? "guest" : "host",
             (unsigned long long)(in_guest ? addr - uintptr_t(g_base) : addr), thread ? thread->id : 0,
-            (unsigned long long)(ctx ? ctx->lr : 0), ctx ? ctx->r1.u32 : 0);
+            (unsigned long long)(ctx ? ctx->lr : 0), ctx ? ctx->r1.u32 : 0, ctx ? guest_backtrace(ctx->r1.u32, 12).c_str() : "");
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
@@ -238,22 +245,34 @@ int main(int argc, char** argv)
     }
     if (const char* s = std::getenv("TT2_TRACE_STACK"); s && *s == '1')
         g_trace_stack = true;
+    if (const char* s = std::getenv("TT2_TRACE_R3"); s && *s)
+        g_trace_r3 = uint32_t(std::strtoul(s, nullptr, 16));
     const fs::path bin = exe_dir();
     const fs::path native = bin.parent_path();
 
     std::error_code ec;
     fs::create_directories(native / "logs", ec);
-    g_log_file = _wfopen((native / "logs" / "tt2.log").c_str(), L"w");
+    // TT2_LOG_NAME: another log file name (two instances on one PC, e.g. a netplay test).
+    const char* log_name = std::getenv("TT2_LOG_NAME");
+    g_log_file = _wfopen((native / "logs" / (log_name && *log_name ? log_name : "tt2.log")).c_str(), L"w");
     AddVectoredExceptionHandler(1, crash_handler);
 
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO))
         fatal("SDL_Init failed: %s", SDL_GetError());
 
     SDL_Window* window = SDL_CreateWindow("Tekken Tag Tournament 2 - Native", 1280, 720, SDL_WINDOW_RESIZABLE | (cmd.fullscreen ? SDL_WINDOW_FULLSCREEN : 0));
-    SDL_Renderer* renderer = window ? SDL_CreateRenderer(window, nullptr) : nullptr;
-    if (!renderer)
+    if (!window)
         fatal("cannot create the game window: %s", SDL_GetError());
-    SDL_SetRenderVSync(renderer, 1);
+    // Direct3D 11 draws the game; without it, a placeholder screen says what is running.
+    SDL_Renderer* renderer = nullptr;
+    void* hwnd = SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+    if (!hwnd || !gpu::renderer::init(hwnd, native / "screenshots"))
+    {
+        renderer = SDL_CreateRenderer(window, nullptr);
+        if (!renderer)
+            fatal("cannot create the game window: %s", SDL_GetError());
+        SDL_SetRenderVSync(renderer, 1);
+    }
     SDL_HideCursor();
 
     input::init();
@@ -265,6 +284,7 @@ int main(int argc, char** argv)
     if (!load_image(bin, error))
         fatal("%s", error.c_str());
     g_memory.fill_function_table();
+    audio::init_xma();
 
     io::mount("\\device\\cdrom0", native / "game", true);
     io::link("game:", "\\device\\cdrom0");
@@ -275,14 +295,47 @@ int main(int argc, char** argv)
     io::mount("\\device\\harddisk0\\cache0", native / "cache", false);
     io::link("hdd:", "\\device\\harddisk0\\partition1");
     io::link("cache:", "\\device\\harddisk0\\cache0");
+#if TT2_TU3
+    // The title update's own files (data100.bin/.ofs), which the patched game reads from
+    // update:\. Setup names the applied update's folder in native\update\active.txt.
+    if (std::ifstream active(native / "update" / "active.txt"); active)
+    {
+        std::string folder;
+        std::getline(active, folder);
+        while (!folder.empty() && (folder.back() == '\r' || folder.back() == ' ' || folder.back() == '\n'))
+            folder.pop_back();
+        if (!folder.empty() && fs::exists(native / "update" / folder, ec))
+        {
+            io::mount("\\device\\update", native / "update" / folder, true);
+            io::link("update:", "\\device\\update");
+        }
+        else
+            log("title update folder '%s' is missing: run Setup.bat again", folder.c_str());
+    }
+#endif
     xam::g_save_root = native / "save";
     fs::create_directories(xam::g_save_root, ec);
 
+    gpu::set_shader_dump_dir(native / "gpu" / "shaders");
     timebase_start();
     netglue::configure(cmd.net);
+    // TT2_ROLLBACK_STRESS=interval[,depth[,start_frame]]: offline rollback determinism test.
+    if (const char* s = std::getenv("TT2_ROLLBACK_STRESS"); s && *s)
+    {
+        int v[3] = { 10, 3, 0 };
+        sscanf(s, "%d,%d,%d", &v[0], &v[1], &v[2]);
+        rollback::configure_stress(v[0], v[1], v[2]);
+    }
 
     log("starting the game at %08X", g_image.entry);
     auto main_thread = kernel::start_thread(g_image.entry, 0, 0, g_image.stack_size, false, "main");
+
+    // TT2_DUMP_THREADS=<seconds>: log where every guest thread is after that long (debugging).
+    if (const char* d = std::getenv("TT2_DUMP_THREADS"); d && std::atoi(d) > 0)
+        std::thread([seconds = std::atoi(d)] {
+            std::this_thread::sleep_for(std::chrono::seconds(seconds));
+            kernel::dump_threads();
+        }).detach();
 
     bool running = true;
     while (running)
@@ -295,7 +348,10 @@ int main(int argc, char** argv)
             input::handle_event(e);
         }
         input::poll();
-        draw_placeholder(renderer, video::frames(), netglue::status_line());
+        if (renderer)
+            draw_placeholder(renderer, video::frames(), netglue::status_line());
+        else
+            SDL_Delay(4);
         if (main_thread->exited)
         {
             log("the game's main thread exited (code %u)", main_thread->exit_code);

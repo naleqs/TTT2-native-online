@@ -7,6 +7,7 @@
 #include "objects.h"
 #include "io.h"
 #include "../memory.h"
+#include "../rollback/game_rollback.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -123,6 +124,7 @@ namespace
     {
         HANDLE h = INVALID_HANDLE_VALUE;
         fs::path path;
+        bool read_only = false;
         bool directory = false;
         uint64_t position = 0;
         std::vector<fs::directory_entry> listing;
@@ -137,6 +139,32 @@ namespace
                 CloseHandle(h);
         }
     };
+
+    // The path in OBJECT_ATTRIBUTES, relative to its RootDirectory handle when that is set (the
+    // game opens files inside a directory it opened earlier).
+    std::optional<io::Resolved> resolve_attributes(uint32_t attributes)
+    {
+        const std::string name = io::object_attributes_path(attributes);
+        const uint32_t root = attributes ? load32(attributes) : 0;
+        const bool absolute = name.find(':') != std::string::npos || (!name.empty() && name[0] == '\\');
+        // 0xFFFFFFFD: the pseudo-handle for the title's own directory.
+        if (root == 0xFFFFFFFD && !absolute)
+            return io::resolve("game:\\" + name);
+        auto dir = root && !absolute ? handle_as<File>(root) : nullptr;
+        if (!dir || !dir->directory)
+            return io::resolve(name);
+        io::Resolved r{ dir->path, dir->read_only };
+        size_t pos = 0;
+        while (pos <= name.size())
+        {
+            const size_t end = std::min(name.find('\\', pos), name.size());
+            const std::string part = name.substr(pos, end - pos);
+            if (!part.empty() && part != ".")
+                r.host /= part;
+            pos = end + 1;
+        }
+        return r;
+    }
 
     constexpr uint32_t XFILE_SUPERSEDE = 0, XFILE_OPEN = 1, XFILE_CREATE = 2, XFILE_OPEN_IF = 3, XFILE_OVERWRITE = 4, XFILE_OVERWRITE_IF = 5;
     constexpr uint32_t XFILE_DIRECTORY_FILE = 0x1;
@@ -175,13 +203,18 @@ namespace
         store32(out + 0x34, 0);
     }
 
-    uint32_t open_file(const Args& a, uint32_t attributes, uint32_t io, uint32_t disposition, uint32_t options, uint32_t desired)
+    uint32_t open_file_impl(const Args& a, uint32_t attributes, uint32_t io, uint32_t disposition, uint32_t options, uint32_t desired)
     {
         const std::string guest_path = io::object_attributes_path(attributes);
-        const auto resolved = io::resolve(guest_path);
+        const auto resolved = resolve_attributes(attributes);
         if (!resolved)
         {
-            log("io: no device for '%s'", guest_path.c_str());
+            {
+                const uint32_t root = attributes ? load32(attributes) : 0;
+                auto obj = root ? object_from_handle(root) : nullptr;
+                log("io: no device for '%s' (root %08X: %s)", guest_path.c_str(), root,
+                    !obj ? "not an object" : std::dynamic_pointer_cast<File>(obj) ? std::dynamic_pointer_cast<File>(obj)->path.string().c_str() : "other object");
+            }
             set_io_status(io, status::object_path_not_found, XFILE_DOES_NOT_EXIST);
             return status::object_path_not_found;
         }
@@ -209,6 +242,7 @@ namespace
 
         auto f = std::make_shared<File>();
         f->path = resolved->host;
+        f->read_only = resolved->read_only;
         uint32_t info = exists ? XFILE_OPENED : XFILE_CREATED;
 
         if (is_dir || (!exists && (options & XFILE_DIRECTORY_FILE)))
@@ -247,6 +281,23 @@ namespace
         return status::success;
     }
 
+    // TT2_LOG_IO=1: log every open and its result (finding files the game expects).
+    uint32_t open_file(const Args& a, uint32_t attributes, uint32_t io, uint32_t disposition, uint32_t options, uint32_t desired)
+    {
+        static const bool log_io = [] {
+            const char* v = std::getenv("TT2_LOG_IO");
+            return v && *v == '1';
+        }();
+        const uint32_t result = open_file_impl(a, attributes, io, disposition, options, desired);
+        if (log_io)
+        {
+            const auto resolved = resolve_attributes(attributes);
+            log("io: open '%s' (root %08X) -> %08X%s%s", io::object_attributes_path(attributes).c_str(), attributes ? load32(attributes) : 0, result,
+                resolved ? " " : "", resolved ? resolved->host.string().c_str() : "");
+        }
+        return result;
+    }
+
     // Shared by NtReadFile / NtWriteFile: completes synchronously, then signals the event.
     uint32_t transfer(const Args& a, bool write, uint32_t buffer, uint32_t length, const be<int64_t>* offset)
     {
@@ -263,6 +314,8 @@ namespace
         ov.Offset = DWORD(pos);
         ov.OffsetHigh = DWORD(pos >> 32);
         DWORD done = 0;
+        if (!write)
+            rollback::note_host_write(buffer, length);
         const BOOL ok = write ? WriteFile(f->h, g_base + buffer, length, &done, &ov) : ReadFile(f->h, g_base + buffer, length, &done, &ov);
         uint32_t result = status::success;
         if (!ok && GetLastError() != ERROR_HANDLE_EOF)
@@ -327,6 +380,8 @@ static uint32_t scatter_gather(const Args& a, bool write)
         ov.Offset = DWORD(pos);
         ov.OffsetHigh = DWORD(uint64_t(pos) >> 32);
         DWORD n = 0;
+        if (!write)
+            rollback::note_host_write(page, chunk);
         const BOOL ok = write ? WriteFile(f->h, g_base + page, chunk, &n, &ov) : ReadFile(f->h, g_base + page, chunk, &n, &ov);
         total += n;
         pos += n;
@@ -456,7 +511,7 @@ TT2_IMPORT(NtSetInformationFile)
 TT2_IMPORT(NtQueryFullAttributesFile)
 {
     Args a{ ctx };
-    const auto resolved = io::resolve(io::object_attributes_path(a.u32(0)));
+    const auto resolved = resolve_attributes(a.u32(0));
     std::error_code ec;
     if (!resolved || !fs::exists(resolved->host, ec))
         return a.ret(status::object_name_not_found);

@@ -16,6 +16,10 @@ tt2_fetch_sdl3()
 tt2_fetch_json()
 
 set(PPC_DIR ${TT2_RECOMP_DIR}/ppc)
+
+# The executable the recompiler output was made from: "retail" or "tu3" (patched with the
+# player's own Title Update 3). Setup passes it; addresses in game/ depend on it.
+set(TT2_GAME_VERSION "retail" CACHE STRING "Game executable version: retail or tu3")
 file(GLOB TT2_PPC_SOURCES CONFIGURE_DEPENDS ${PPC_DIR}/ppc_recomp.*.cpp)
 list(APPEND TT2_PPC_SOURCES ${PPC_DIR}/ppc_func_mapping.cpp)
 
@@ -34,9 +38,15 @@ set(TT2_RUNTIME_SOURCES
     kernel/xam.cpp
     kernel/system.cpp
     gpu/video.cpp
+    gpu/capture.cpp
+    gpu/renderer_d3d11.cpp
+    gpu/shader_translator.cpp
     audio/audio.cpp
     input/input.cpp
-    rollback/snapshot.cpp)
+    rollback/snapshot.cpp
+    rollback/game_rollback.cpp
+    game/tt2_frame.cpp
+    game/tt2_fixes.cpp)
 
 # Logging stubs for every import without a TT2_IMPORT implementation.
 set(TT2_STUBS ${CMAKE_CURRENT_BINARY_DIR}/import_stubs.cpp)
@@ -63,7 +73,10 @@ target_compile_options(tt2_ppc PRIVATE
 add_executable(tt2 ${TT2_RUNTIME_SOURCES} ${TT2_STUBS} $<TARGET_OBJECTS:tt2_ppc>)
 target_include_directories(tt2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${PPC_DIR} ${TT2_SIMDE_DIR})
 target_compile_options(tt2 PRIVATE -O2 -march=x86-64-v3 -fno-strict-aliasing)
-target_link_libraries(tt2 PRIVATE tt2_netplay SDL3::SDL3-static nlohmann_json::nlohmann_json winmm)
+if(TT2_GAME_VERSION STREQUAL "tu3")
+    target_compile_definitions(tt2 PRIVATE TT2_TU3=1)
+endif()
+target_link_libraries(tt2 PRIVATE tt2_netplay SDL3::SDL3-static nlohmann_json::nlohmann_json winmm d3d11 dxgi)
 if(MINGW)
     target_link_options(tt2 PRIVATE -mwindows)
 endif()

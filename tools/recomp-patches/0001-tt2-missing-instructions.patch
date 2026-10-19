@@ -1,5 +1,5 @@
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..a1922c5 100644
+index fa91527..f329d5a 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
 @@ -827,23 +827,26 @@ bool Recompiler::Recompile(
@@ -51,7 +51,7 @@ index fa91527..a1922c5 100644
          break;
  
      case PPC_INST_VEXPTEFP:
-@@ -2149,6 +2156,344 @@ bool Recompiler::Recompile(
+@@ -2149,6 +2156,358 @@ bool Recompiler::Recompile(
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_vsr(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
          break;
  
@@ -241,7 +241,21 @@ index fa91527..a1922c5 100644
 +
 +    case PPC_INST_MACCHWU:
 +    case PPC_INST_MACLHWU:
-+        // PPC405 multiply-accumulate does not exist on Xenon: this is data the analyser took for code
++        // PPC405 multiply-accumulate does not exist on Xenon. The opcode table matches these
++        // before vsldoi128 (VX128_5), which shares the encoding space; decode that instead.
++        if ((insn.instruction & 0xFC000010) == 0x10000010)
++        {
++            const uint32_t w = insn.instruction;
++            const uint32_t vd = ((w << 3) & 0x60) | ((w >> 21) & 0x1F);
++            const uint32_t va = ((w >> 4) & 0x40) | (w & 0x20) | ((w >> 16) & 0x1F);
++            const uint32_t vb = ((w << 5) & 0x60) | ((w >> 11) & 0x1F);
++            const uint32_t sh = (w >> 6) & 0xF;
++            println("\t// vsldoi128 v{},v{},v{},{} (decoded as {})", vd, va, vb, sh, insn.opcode->name);
++            println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_alignr_epi8(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8), {}));",
++                v(vd), v(va), v(vb), 16 - sh);
++            break;
++        }
++        // Otherwise data the analyser took for code.
 +        println("\t// {} (not a Xenon instruction)", insn.opcode->name);
 +        break;
 +
