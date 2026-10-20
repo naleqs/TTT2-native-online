@@ -401,8 +401,13 @@ namespace
         return true;
     }
 
-    // Returns the remaining recursion count.
-    int32_t release(uint32_t address)
+    void mirror_cs(uint32_t cs, uint32_t owner, int32_t recursion);
+
+    // Returns the remaining recursion count. For a critical section (`cs`), its guest-visible
+    // fields are updated while the lock is still held: once another thread can take the lock,
+    // the critical section may already be gone (a stack object whose owner returned), and a late
+    // write would land in someone else's stack frame.
+    int32_t release(uint32_t address, bool cs = false)
     {
         int32_t remaining = 0;
         {
@@ -411,6 +416,8 @@ namespace
             if (l.recursion > 0)
                 l.recursion--;
             remaining = l.recursion;
+            if (cs)
+                mirror_cs(address, remaining ? l.owner : 0, remaining);
             if (remaining == 0)
                 l.owner = 0;
         }
@@ -506,7 +513,5 @@ TT2_IMPORT(RtlTryEnterCriticalSection)
 
 TT2_IMPORT(RtlLeaveCriticalSection)
 {
-    const uint32_t cs = ctx.r3.u32;
-    const int32_t remaining = release(cs);
-    mirror_cs(cs, remaining ? load32(cs + 0x18) : 0, remaining);
+    release(ctx.r3.u32, true);
 }

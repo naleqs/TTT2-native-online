@@ -28,6 +28,7 @@ namespace tt2::kernel
         bool adopted = false;            // a runtime host thread running guest callbacks
         std::atomic<int> blocked{ 0 };   // inside a kernel wait or sleep (netplay barrier)
         int busy_frames = 0;             // netplay barrier: frames it kept the barrier waiting
+        int idle_misses = 0;             // wait_for_all_threads: times it did not settle
         std::atomic<int64_t> last_io_ms{ -1000000 }; // last file call (steady clock, ms): a loader
 
         ObjectType type() const override { return ObjectType::Thread; }
@@ -65,8 +66,16 @@ namespace tt2::kernel
     // Threads that never block (spinning) stop being waited for after a few frames.
     void wait_for_other_threads(int timeout_ms);
 
+    // Waits (up to `timeout_ms`) until every guest thread started at `start_address` is blocked.
+    // False on timeout.
+    bool wait_until_blocked(uint32_t start_address, int timeout_ms);
+    // Waits (up to `timeout_ms`) until every other guest thread is blocked (threads that never
+    // block are given up on after a few frames, as in wait_for_other_threads).
+    void wait_for_all_threads(int timeout_ms);
+
     // File calls mark the calling thread as a loader for a few seconds (the barrier's scope).
     void note_file_activity();
+    extern std::atomic<uint64_t> g_file_reads; // NtReadFile calls so far (diagnostics)
 
     // Thrown by ExTerminateThread and caught at the top of the thread.
     struct ThreadExit

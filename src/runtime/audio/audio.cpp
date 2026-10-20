@@ -44,6 +44,28 @@ namespace tt2::audio
         std::atomic<bool> g_muted{ false };
         std::thread g_thread;
 
+        std::atomic<bool> g_frame_driven{ false }; // netplay: frame_step() drives audio
+        std::mutex g_tick_mutex;
+
+        // One mixer tick: every client renders 256 samples, which are mixed and queued.
+        void tick()
+        {
+            std::lock_guard lock(g_tick_mutex);
+            std::fill(std::begin(g_mix), std::end(g_mix), 0.0f);
+            g_mixed = false;
+            for (Client& c : g_clients)
+                if (const uint32_t cb = c.callback)
+                    call_guest(cb, uint32_t(c.arg));
+            if (g_mixed && g_stream && !g_muted)
+            {
+                for (float& v : g_mix)
+                    v = std::clamp(v, -1.0f, 1.0f);
+                // Frame-driven audio can run ahead of the device a little; drop rather than lag.
+                if (!g_frame_driven || SDL_GetAudioStreamQueued(g_stream) < int(12 * kFrameSamples * 2 * sizeof(float)))
+                    SDL_PutAudioStreamData(g_stream, g_mix, sizeof(g_mix));
+            }
+        }
+
         void driver_thread()
         {
             kernel::adopt_host_thread("audio");
@@ -53,20 +75,8 @@ namespace tt2::audio
             {
                 // Keep ~3 frames queued: enough to ride out jitter, little latency.
                 const int queued = g_stream ? SDL_GetAudioStreamQueued(g_stream) : 0;
-                if (queued < int(3 * kFrameSamples * 2 * sizeof(float)))
-                {
-                    std::fill(std::begin(g_mix), std::end(g_mix), 0.0f);
-                    g_mixed = false;
-                    for (Client& c : g_clients)
-                        if (const uint32_t cb = c.callback)
-                            call_guest(cb, uint32_t(c.arg));
-                    if (g_mixed && g_stream && !g_muted)
-                    {
-                        for (float& v : g_mix)
-                            v = std::clamp(v, -1.0f, 1.0f);
-                        SDL_PutAudioStreamData(g_stream, g_mix, sizeof(g_mix));
-                    }
-                }
+                if (!g_frame_driven && queued < int(3 * kFrameSamples * 2 * sizeof(float)))
+                    tick();
                 next += frame;
                 const auto now = std::chrono::steady_clock::now();
                 if (next < now - std::chrono::milliseconds(50))
@@ -346,21 +356,40 @@ namespace
         store32(c + 16, (load32(c + 16) & 0x7FFFFFFF) | (current << 31));
     }
 
+    void xma_pass()
+    {
+        std::lock_guard lock(g_xma_mutex);
+        xma_commands();
+        for (uint32_t c : g_xma_contexts)
+            if (g_xma_enabled[(c - g_xma_array) / 64])
+                xma_work(c);
+    }
+
     void xma_thread()
     {
         while (g_xma_running)
         {
-            {
-                std::lock_guard lock(g_xma_mutex);
-                xma_commands();
-                for (uint32_t c : g_xma_contexts)
-                    if (g_xma_enabled[(c - g_xma_array) / 64])
-                        xma_work(c);
-            }
+            if (!tt2::audio::g_frame_driven)
+                xma_pass();
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
     }
 }
+
+void audio::frame_step()
+{
+    static int sample_debt = 0;
+    g_frame_driven = true;
+    sample_debt += kRate / 60;
+    while (sample_debt >= kFrameSamples)
+    {
+        sample_debt -= kFrameSamples;
+        xma_pass();
+        tick();
+    }
+}
+
+void audio::stop_frame_driven() { g_frame_driven = false; }
 
 void audio::init_xma()
 {

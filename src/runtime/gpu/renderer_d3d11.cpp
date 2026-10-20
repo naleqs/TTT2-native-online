@@ -11,6 +11,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <tuple>
 #include <chrono>
 #include <thread>
 #include <mutex>
@@ -434,6 +435,24 @@ float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(uint2(i.
 // Colour resolve from a multisampled (sample-resolution) surface: sample 0 of each pixel.
 Texture2D color_src : register(t0);
 float4 ps_color_copy(BlitOut i) : SV_Target { return color_src.Load(int3(uint2(i.pos.xy) * copy_scale.xy, 0)); }
+// EDRAM aliasing: the pixels of this surface that lie in EDRAM tiles another surface wrote,
+// fetched from that surface. A tile is tile_width x 16 samples; a surface's row of tiles is
+// pitch / tile_width tiles. edram: this surface's first tile and tiles per row, the other's;
+// edram2: tile width, the other surface's used rows.
+cbuffer EdramConsts : register(b5) { uint4 edram; uint4 edram2; };
+float4 ps_edram_copy(BlitOut i) : SV_Target
+{
+    const uint2 p = uint2(i.pos.xy);
+    const uint tw = edram2.x;
+    const uint tile = edram.x + (p.y / 16) * edram.y + p.x / tw;
+    if (tile < edram.z || tile >= 2048)
+        discard;
+    const uint rel = tile - edram.z;
+    const uint2 q = uint2((rel % edram.w) * tw + p.x % tw, (rel / edram.w) * 16 + p.y % 16);
+    if (q.y >= edram2.y)
+        discard;
+    return color_src.Load(int3(q, 0));
+}
 // FPS overlay: up to 8 characters of a 3x5 font (4 bits each in text.x, count in text.y) in a
 // dark box at pixel text.zw, text_scale.x pixels per font cell.
 cbuffer TextConsts : register(b4) { uint4 text; uint4 text_scale; };
@@ -457,6 +476,8 @@ float4 ps_text(BlitOut i) : SV_Target
         ComPtr<ID3D11PixelShader> g_ps_blit;
         ComPtr<ID3D11PixelShader> g_ps_depth_copy;
         ComPtr<ID3D11PixelShader> g_ps_color_copy;
+        ComPtr<ID3D11PixelShader> g_ps_edram_copy;
+        ComPtr<ID3D11Buffer> g_cb_edram;
         ComPtr<ID3D11Buffer> g_cb_copy;
         ComPtr<ID3D11PixelShader> g_ps_text;
         ComPtr<ID3D11Buffer> g_cb_text;
@@ -474,8 +495,16 @@ float4 ps_text(BlitOut i) : SV_Target
             ComPtr<ID3D11ShaderResourceView> srv;
             DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN; // texture format (typeless for depth)
             uint32_t width = 0, height = 0;
+            // EDRAM aliasing (render targets only): where the surface starts in EDRAM, how wide its
+            // tiles are, when it was last written, and how far down it has been used.
+            uint32_t base = 0;
+            bool depth = false;
+            uint32_t tile_width = 80;   // samples per EDRAM tile row: 80 at 32 bpp, 40 at 64 bpp
+            uint64_t written = 0;       // g_edram_stamp of the last draw, clear or sync into it
+            uint32_t used_rows = 0;     // sample rows ever drawn
         };
         std::map<uint64_t, Surface> g_render_targets;
+        uint64_t g_edram_stamp = 0;
 
         DXGI_FORMAT color_rt_format(uint32_t f)
         {
@@ -522,6 +551,8 @@ float4 ps_text(BlitOut i) : SV_Target
             Surface s;
             s.width = pitch;
             s.height = kRtHeight;
+            s.base = base;
+            s.depth = depth;
             D3D11_TEXTURE2D_DESC d{};
             d.Width = s.width;
             d.Height = s.height;
@@ -540,6 +571,9 @@ float4 ps_text(BlitOut i) : SV_Target
                 s.format = color_rt_format(format);
                 d.Format = s.format;
                 d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                const bool wide = s.format == DXGI_FORMAT_R16G16B16A16_FLOAT || s.format == DXGI_FORMAT_R16G16B16A16_UNORM ||
+                                  s.format == DXGI_FORMAT_R16G16B16A16_SNORM || s.format == DXGI_FORMAT_R32G32_FLOAT;
+                s.tile_width = wide ? 40 : 80;
             }
             if (FAILED(g_device->CreateTexture2D(&d, nullptr, &s.tex)))
                 return nullptr;
@@ -567,15 +601,40 @@ float4 ps_text(BlitOut i) : SV_Target
             uint32_t width = 0, height = 0;
             bool depth = false;
             uint64_t frame = 0;
+            uint64_t serial = 0; // bumped by every resolve into it
         };
         std::map<uint32_t, Resolved> g_resolved;
+
+        // A resolved copy fetched as a texture of a different size (the game renders its 3D scene
+        // at a varying width, 960 or 1024, and samples the copy as a 1280-wide texture with the
+        // coordinates scaled to match): the copy placed at the top left of a texture of the
+        // fetched size, so texel (x, y) is the same in both, as in guest memory.
+        struct FetchView
+        {
+            Surface surface;
+            uint64_t serial = ~0ull;
+        };
+        std::map<std::tuple<uint32_t, uint32_t, uint32_t>, FetchView> g_fetch_views;
         uint64_t g_frame = 0;
 
         // TT2_GPU_DUMP_FRAME=N: log every draw, texture and resolve of frame N and write the
         // HLSL of its shaders to native\gpu\dump.
         uint64_t g_dump_frame = ~0ull;
         fs::path g_dump_dir;
-        bool dumping() { return g_frame + 1 == g_dump_frame; }
+        // TT2_GPU_TRACE_BASE=hex (with the dump output): dump every draw into that EDRAM base and
+        // every resolve from it, in any frame (up to 600 of them).
+        bool g_trace_draw = false;
+        const uint32_t g_trace_base = [] { const char* v = std::getenv("TT2_GPU_TRACE_BASE"); return v ? uint32_t(std::strtoul(v, nullptr, 16)) : 0xFFFFFFFFu; }();
+        int g_traced = 0;
+        bool trace_matches(uint32_t info)
+        {
+            static const uint64_t from = [] { const char* v = std::getenv("TT2_GPU_TRACE_FROM"); return v ? std::strtoull(v, nullptr, 10) : 0ull; }();
+            const bool hit = (info & 0xFFF) == g_trace_base && g_traced < 600 && g_frame >= from;
+            if (hit)
+                g_traced++;
+            return hit;
+        }
+        bool dumping() { return g_frame + 1 == g_dump_frame || g_trace_draw; }
         std::set<const void*> g_dumped_shaders;
 
         DXGI_FORMAT depth_srv_format(DXGI_FORMAT typeless)
@@ -713,6 +772,39 @@ float4 ps_text(BlitOut i) : SV_Target
                 else if (rf == DXGI_FORMAT_R16G16_FLOAT || rf == DXGI_FORMAT_R32G32_FLOAT)
                     map = two;
                 b.srv = res.surface.srv.Get();
+                if ((width != res.width || height != res.height) && res.surface.tex)
+                {
+                    FetchView& fv = g_fetch_views[{ base, width, height }];
+                    if (!fv.surface.tex || fv.surface.format != res.surface.format)
+                    {
+                        D3D11_TEXTURE2D_DESC d{};
+                        d.Width = width;
+                        d.Height = height;
+                        d.MipLevels = d.ArraySize = 1;
+                        d.Format = res.surface.format;
+                        d.SampleDesc.Count = 1;
+                        d.Usage = D3D11_USAGE_DEFAULT;
+                        d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                        fv = FetchView{};
+                        fv.surface.format = res.surface.format;
+                        if (SUCCEEDED(g_device->CreateTexture2D(&d, nullptr, &fv.surface.tex)))
+                        {
+                            D3D11_SHADER_RESOURCE_VIEW_DESC v{};
+                            v.Format = res.surface.format;
+                            v.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                            v.Texture2D.MipLevels = 1;
+                            g_device->CreateShaderResourceView(fv.surface.tex.Get(), &v, &fv.surface.srv);
+                        }
+                    }
+                    if (fv.surface.tex && fv.serial != res.serial)
+                    {
+                        fv.serial = res.serial;
+                        const D3D11_BOX box{ 0, 0, 0, std::min(width, res.width), std::min(height, res.height), 1 };
+                        g_ctx->CopySubresourceRegion(fv.surface.tex.Get(), 0, 0, 0, 0, res.surface.tex.Get(), 0, &box);
+                    }
+                    if (fv.surface.srv)
+                        b.srv = fv.surface.srv.Get();
+                }
                 b.swizzle = combine_swizzle(swizzle, map);
                 return b;
             }
@@ -1143,17 +1235,93 @@ float4 ps_text(BlitOut i) : SV_Target
             return EXCEPTION_CONTINUE_EXECUTION;
         }
 
+        // The console has one EDRAM; surfaces at different bases and pitches overlap in it, and games
+        // rely on that (TTT2 composites costumes in a 1024x1024 surface and copies parts of it out
+        // through a 512x512 surface that lies inside it). Each surface is a separate texture here,
+        // so before a surface is drawn into or resolved, the parts of it that another surface wrote
+        // more recently are copied in, tile by tile.
+        void edram_mark(Surface& s, uint32_t rows)
+        {
+            s.written = ++g_edram_stamp;
+            s.used_rows = std::min(std::max(s.used_rows, rows), s.height);
+        }
+
+        void edram_sync(Surface& s)
+        {
+            if (s.depth || !s.rtv || !g_ps_edram_copy)
+                return;
+            const uint32_t s_tpr = std::max(1u, s.width / s.tile_width);
+            std::vector<Surface*> newer;
+            for (auto& [key, o] : g_render_targets)
+                if (&o != &s && !o.depth && o.written > s.written && o.tile_width == s.tile_width && o.used_rows && o.tex)
+                    newer.push_back(&o);
+            if (newer.empty())
+                return;
+            std::sort(newer.begin(), newer.end(), [](Surface* a, Surface* b) { return a->written < b->written; });
+            for (Surface* o : newer)
+            {
+                const uint32_t o_tpr = std::max(1u, o->width / o->tile_width);
+                const uint32_t o_end = std::min(2048u, o->base + (o->used_rows + 15) / 16 * o_tpr);
+                const uint32_t s_end = std::min(2048u, s.base + (s.height / 16) * s_tpr);
+                const uint32_t lo = std::max(s.base, o->base), hi = std::min(s_end, o_end);
+                if (lo >= hi)
+                    continue;
+                if (!o->srv)
+                {
+                    D3D11_SHADER_RESOURCE_VIEW_DESC v{};
+                    v.Format = o->format;
+                    v.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                    v.Texture2D.MipLevels = 1;
+                    g_device->CreateShaderResourceView(o->tex.Get(), &v, &o->srv);
+                }
+                if (!o->srv)
+                    continue;
+                const uint32_t row0 = (lo - s.base) / s_tpr * 16, row1 = std::min(s.height, (hi - s.base + s_tpr - 1) / s_tpr * 16);
+                const uint32_t consts[8] = { s.base, s_tpr, o->base, o_tpr, s.tile_width, o->used_rows, 0, 0 };
+                update_cbuffer(g_cb_edram.Get(), consts, sizeof(consts));
+                ID3D11ShaderResourceView* none[32] = {};
+                g_ctx->PSSetShaderResources(0, 32, none);
+                g_ctx->OMSetRenderTargets(1, s.rtv.GetAddressOf(), nullptr);
+                const D3D11_VIEWPORT vp{ 0, 0, float(s.width), float(s.height), 0, 1 };
+                const D3D11_RECT sc{ 0, LONG(row0), LONG(s.width), LONG(row1) };
+                g_ctx->RSSetViewports(1, &vp);
+                g_ctx->RSSetScissorRects(1, &sc);
+                g_ctx->RSSetState(raster_state(0));
+                g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+                g_ctx->OMSetDepthStencilState(nullptr, 0);
+                g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                g_ctx->IASetInputLayout(nullptr);
+                g_ctx->VSSetShader(g_vs_blit.Get(), nullptr, 0);
+                g_ctx->GSSetShader(nullptr, nullptr, 0);
+                g_ctx->PSSetShader(g_ps_edram_copy.Get(), nullptr, 0);
+                g_ctx->PSSetConstantBuffers(5, 1, g_cb_edram.GetAddressOf());
+                g_ctx->PSSetShaderResources(0, 1, o->srv.GetAddressOf());
+                g_ctx->Draw(3, 0);
+                g_ctx->PSSetShaderResources(0, 1, none);
+                g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
+                s.used_rows = std::max(s.used_rows, row1);
+                static int logged = 0;
+                if (logged++ < 20)
+                    log("renderer: EDRAM alias: surface %03X (pitch %u) takes rows %u-%u from surface %03X (pitch %u)", s.base, s.width, row0, row1,
+                        o->base, o->width);
+            }
+            s.written = ++g_edram_stamp;
+        }
+
         void resolve()
         {
             const uint32_t control = r(RB_COPY_CONTROL);
             const uint32_t command = (control >> 20) & 3;
             const uint32_t src_select = control & 7;
             const bool depth = src_select >= 4;
+            g_trace_draw = g_trace_base != 0xFFFFFFFFu && !depth && trace_matches(r(RB_COLOR_INFO_REGS[src_select & 3]));
             const uint32_t pitch = sample_pitch();
             const uint32_t sx = msaa_x(), sy = msaa_y();
             Surface* src = render_target(depth ? r(RB_DEPTH_INFO) : r(RB_COLOR_INFO_REGS[src_select & 3]), pitch, depth);
             if (!src)
                 return;
+            if (!depth)
+                edram_sync(*src);
 
             // The rectangle: the resolve "draw" is a rectangle list of 3 float2 vertices in vf0.
             const uint32_t vf0 = r(kFetchConsts), vf1 = r(kFetchConsts + 1);
@@ -1206,7 +1374,9 @@ float4 ps_text(BlitOut i) : SV_Target
                 const bool by_pass = depth || sx > 1 || sy > 1;
                 if (!res.surface.tex || res.width != dw || res.height != dh || res.surface.format != dest_format)
                 {
+                    const uint64_t serial = res.serial; // fetch views compare against it
                     res = Resolved{};
+                    res.serial = serial;
                     res.width = dw;
                     res.height = dh;
                     res.depth = depth;
@@ -1225,6 +1395,7 @@ float4 ps_text(BlitOut i) : SV_Target
                         g_device->CreateRenderTargetView(res.surface.tex.Get(), nullptr, &res.surface.rtv);
                 }
                 res.frame = g_frame;
+                res.serial++;
                 // TT2_GPU_DUMP_ON_RESOLVE=<dest hex>: dump the frame after a resolve there (the Nth burst of
                 // them with TT2_GPU_DUMP_NTH, TT2_GPU_DUMP_DELAY frames later).
                 static const uint32_t dump_on = [] { const char* v = std::getenv("TT2_GPU_DUMP_ON_RESOLVE"); return v ? uint32_t(std::strtoul(v, nullptr, 16)) : 0u; }();
@@ -1348,6 +1519,7 @@ float4 ps_text(BlitOut i) : SV_Target
                         g_ctx1->ClearView(c->rtv.Get(), color, &rect, 1);
                     else
                         g_ctx->ClearRenderTargetView(c->rtv.Get(), color);
+                    edram_mark(*c, uint32_t(std::max(0, y1)) * sy);
                 }
             }
             if ((control >> 9) & 1)
@@ -1410,6 +1582,9 @@ float4 ps_text(BlitOut i) : SV_Target
                 return;
             const TranslatedShader& vm = g_current_vs->meta;
             const TranslatedShader& pm = g_current_ps->meta;
+            g_trace_draw = g_trace_base != 0xFFFFFFFFu && !depth_only && trace_matches(r(RB_COLOR_INFO));
+            if (g_trace_draw)
+                log("dump: traced draw in frame %llu", (unsigned long long)g_frame);
             if (dumping())
             {
                 g_dump_draw++;
@@ -1473,6 +1648,10 @@ float4 ps_text(BlitOut i) : SV_Target
                 if ((pm.color_targets & (1u << i)) && ((color_mask >> (i * 4)) & 0xF))
                     if (Surface* s = render_target(r(RB_COLOR_INFO_REGS[i]), pitch, false))
                     {
+                        edram_sync(*s);
+                        int32_t sx0_, sy0_, sx1_, sy1_;
+                        scissor(sx0_, sy0_, sx1_, sy1_);
+                        edram_mark(*s, uint32_t(std::max(0, sy1_)) * sy);
                         rtvs[i] = s->rtv.Get();
                         rt_width = s->width;
                     }
@@ -2019,6 +2198,10 @@ float4 ps_text(BlitOut i) : SV_Target
             g_device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_ps_text);
         else
             log("renderer: ps_text: %s", error.c_str());
+        if (auto code = compile(kFixedHlsl, "ps_edram_copy", "ps_5_0", &error))
+            g_device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_ps_edram_copy);
+        else
+            log("renderer: ps_edram_copy: %s", error.c_str());
         if (auto code = compile(kFixedHlsl, "ps_color_copy", "ps_5_0", &error))
             g_device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_ps_color_copy);
         else
@@ -2042,6 +2225,7 @@ float4 ps_text(BlitOut i) : SV_Target
         g_cb_int = make_cbuffer(sizeof(IntConsts));
         g_cb_draw = make_cbuffer(sizeof(DrawConsts));
         g_cb_copy = make_cbuffer(16);
+        g_cb_edram = make_cbuffer(32);
         g_cb_text = make_cbuffer(32);
         if (const char* v = std::getenv("TT2_SHOW_FPS"))
             g_show_fps = std::atoi(v) != 0;

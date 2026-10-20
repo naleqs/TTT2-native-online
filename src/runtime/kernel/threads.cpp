@@ -75,6 +75,8 @@ namespace tt2::kernel
             if (!t.stack_base)
                 fatal("out of guest memory for a %u KB thread stack", t.stack_size / 1024);
             std::memset(g_base + t.stack_base, 0, t.stack_size);
+            if (std::getenv("TT2_LOG_STACKS"))
+                tt2::log("thread %u stack %08X-%08X", t.id, t.stack_base, t.stack_base + t.stack_size);
 
             // ObReferenceObjectByHandle hands out the TEB as the thread object.
             t.body = teb;
@@ -195,6 +197,56 @@ namespace tt2::kernel
             t->last_io_ms.store(now_ms(), std::memory_order_relaxed);
     }
 
+    void wait_for_all_threads(int timeout_ms)
+    {
+        Thread* self = t_thread.get();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        int quiet = 0;
+        for (;;)
+        {
+            std::vector<Thread*> running;
+            for_each_thread([&](Thread& t) {
+                if (&t == self || t.adopted || !t.started || t.exited || t.suspend_count > 0 || t.idle_misses >= 3)
+                    return;
+                if (t.blocked.load(std::memory_order_acquire) == 0)
+                    running.push_back(&t);
+            });
+            if (running.empty())
+            {
+                if (++quiet >= 2)
+                    return;
+            }
+            else
+                quiet = 0;
+            if (std::chrono::steady_clock::now() >= deadline)
+            {
+                for (Thread* t : running)
+                    if (++t->idle_misses == 3)
+                        tt2::log("netplay: thread %u never settles; no longer waited for", t->id);
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    }
+
+    bool wait_until_blocked(uint32_t start_address, int timeout_ms)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        for (;;)
+        {
+            bool busy = false;
+            for_each_thread([&](Thread& t) {
+                if (t.start_address == start_address && t.started && !t.exited && t.blocked.load(std::memory_order_acquire) == 0)
+                    busy = true;
+            });
+            if (!busy)
+                return true;
+            if (std::chrono::steady_clock::now() >= deadline)
+                return false;
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    }
+
     void wait_for_other_threads(int timeout_ms)
     {
         Thread* self = t_thread.get();
@@ -205,7 +257,7 @@ namespace tt2::kernel
         {
             std::vector<Thread*> running;
             for_each_thread([&](Thread& t) {
-                if (&t == self || t.adopted || !t.started || t.exited || t.suspend_count > 0 || t.busy_frames >= 30)
+                if (&t == self || t.adopted || !t.started || t.exited || t.suspend_count > 0 || t.busy_frames >= 3)
                     return;
                 // Only loaders: threads that used the file system in the last 3 seconds. Waiting
                 // for every worker (physics, audio) would cost a lot of time every frame.
@@ -225,7 +277,7 @@ namespace tt2::kernel
             if (std::chrono::steady_clock::now() >= deadline)
             {
                 for (Thread* t : running)
-                    if (++t->busy_frames == 30)
+                    if (++t->busy_frames == 3)
                         tt2::log("netplay: thread %u (%s) never goes idle; no longer waited for", t->id, t->name.c_str());
                 return;
             }

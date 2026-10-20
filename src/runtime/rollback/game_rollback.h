@@ -17,6 +17,8 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace tt2::rollback
 {
@@ -32,6 +34,10 @@ namespace tt2::rollback
     // The main thread enters/leaves the frame's draw pass (pages first written while drawing
     // are presentation state and never rolled back).
     void draw_pass(bool drawing);
+
+    // The game's task walk (all game logic, including the fight) runs from inside the draw pass:
+    // its writes are game state. Returns the previous setting, to restore afterwards.
+    bool set_simulation(bool simulation);
 
     // True while a frame is being re-simulated (no presenting, no new sounds).
     bool resimulating();
@@ -52,6 +58,11 @@ namespace tt2::rollback
     // inputs (keystrokes) is rebuilt for each run of a frame.
     int current_frame(uint64_t* serial);
 
+    // The battle scene's update ran in this live frame (game/tt2_frame.cpp's hook).
+    void note_battle_scene();
+    // The round clock went down in this live frame: the players have control.
+    void note_round_tick();
+
     bool netplay_active();
     std::string status_line();
     void shutdown();
@@ -60,4 +71,14 @@ namespace tt2::rollback
 namespace tt2::game
 {
     void run_frame_body(const rollback::FrameRegs& regs);
+    // The game's render thread (it draws the previous frame from game objects while the next one
+    // is simulated): rollback waits for it to be idle before restoring memory.
+    uint32_t render_thread_entry();
+    // Memory that other threads share with the game logic but that does not affect it (the sound
+    // engine): never rolled back, so those threads never see it rewound under them.
+    std::vector<std::pair<uint32_t, uint32_t>> excluded_from_rollback();
+    // At a round start both games are in the same state except for how many frames each needed
+    // to get there (intros differ with each player's save data): the game's frame counter is set
+    // to the shared netplay frame on both.
+    void align_frame_counter(int netplay_frame);
 }

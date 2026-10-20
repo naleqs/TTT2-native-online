@@ -31,8 +31,11 @@ namespace tt2::netplay
         constexpr Input y = 0x8000;
         constexpr Input left_trigger = 0x10000;
         constexpr Input right_trigger = 0x20000;
+        // Not a button: "this game has reached the battle and waits for the other one" (the
+        // battle start barrier). Never passed to the game.
+        constexpr Input sync_ready = 0x40000;
 
-        constexpr Input all_valid = 0x3F3FF;
+        constexpr Input all_valid = 0x7F3FF;
     }
 
     constexpr int kMaxPlayers = 2;

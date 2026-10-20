@@ -352,10 +352,16 @@ TT2_IMPORT(NtOpenFile)
 }
 
 // NtReadFile(handle, event, apc_routine, apc_context, io_status, buffer, length, byte_offset*)
+namespace tt2::kernel
+{
+    std::atomic<uint64_t> g_file_reads{ 0 }; // NtReadFile calls (diagnostics)
+}
+
 TT2_IMPORT(NtReadFile)
 {
     Args a{ ctx };
     note_file_activity();
+    g_file_reads.fetch_add(1, std::memory_order_relaxed);
     a.ret(transfer(a, false, a.u32(5), a.u32(6), a.ptr<be<int64_t>>(7)));
 }
 

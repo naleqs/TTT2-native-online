@@ -22,6 +22,8 @@
 
 #include <atomic>
 #include <thread>
+#include <set>
+#include <map>
 #include <SDL3/SDL.h>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -79,6 +81,69 @@ namespace tt2
             r1 = caller;
         }
         return out;
+    }
+
+    // TT2_PROFILE=1: samples the main thread's guest call stack every 2 ms and, every 5 seconds,
+    // logs the call sites seen in most samples (finding the code that runs in a given scene).
+    void start_profiler(std::shared_ptr<kernel::Thread> thread)
+    {
+        const char* v = std::getenv("TT2_PROFILE");
+        if (!v || *v != '1')
+            return;
+        std::thread([thread] {
+            int window = 0;
+            for (;;)
+            {
+                std::map<uint32_t, int> counts;
+                int samples = 0;
+                const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (std::chrono::steady_clock::now() < end)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    // The game's main loop runs on its "nuscMain" thread.
+                    PPCContext* ctx = nullptr;
+                    kernel::for_each_thread([&](kernel::Thread& t) {
+                        if (t.name == "nuscMain")
+                            ctx = t.context;
+                    });
+                    if (!ctx)
+                        ctx = thread->context;
+                    if (!ctx)
+                        continue;
+                    samples++;
+                    std::set<uint32_t> seen;
+                    uint32_t r1 = ctx->r1.u32;
+                    for (int i = 0; i < 24; i++)
+                    {
+                        if (r1 < 0x40000000 || r1 >= 0x7F000000)
+                            break;
+                        const uint32_t caller = load32(r1);
+                        if (caller <= r1 || caller >= 0x7F000000)
+                            break;
+                        const uint32_t lr = load32(caller - 8);
+                        if (lr >= 0x82000000 && lr < 0x84000000 && seen.insert(lr).second)
+                            counts[lr]++;
+                        r1 = caller;
+                    }
+                }
+                std::vector<std::pair<int, uint32_t>> top;
+                for (auto [a, n] : counts)
+                    top.push_back({ n, a });
+                std::sort(top.rbegin(), top.rend());
+                std::string line;
+                for (size_t i = 0; i < top.size() && i < 80; i++)
+                {
+                    char buf[24];
+                    snprintf(buf, sizeof(buf), " %08X:%d", top[i].second, top[i].first);
+                    line += buf;
+                }
+                static uint64_t reads_before = 0;
+                const uint64_t reads = kernel::g_file_reads.load();
+                log("profile %d (%d samples, video frame %llu, %llu file reads):%s", window++, samples, (unsigned long long)video::frames(),
+                    (unsigned long long)(reads - reads_before), line.c_str());
+                reads_before = reads;
+            }
+        }).detach();
     }
 
     void trace_import(const char* name, const PPCContext& ctx)
@@ -193,7 +258,21 @@ namespace
         static std::atomic<int> logged{ 0 };
         // A watch address that is not page aligned: only writes to its 16 bytes are logged.
         const uint32_t guest = uint32_t(addr - uintptr_t(g_base));
-        const bool wanted = !(g_watch_exact & 0xFFF) || (guest & ~0xFu) == (g_watch_exact & ~0xFu);
+        bool wanted = !(g_watch_exact & 0xFFF) || (guest & ~0xFu) == (g_watch_exact & ~0xFu);
+        // TT2_WATCH_FOREIGN=1: only writes by a thread other than the one whose stack this is
+        // (a late write into a stack frame that is gone, by the GPU thread or a worker).
+        static const bool foreign_only = [] { const char* v = std::getenv("TT2_WATCH_FOREIGN"); return v && *v == '1'; }();
+        if (foreign_only)
+        {
+            const auto me = kernel::current_thread();
+            bool own = false;
+            if (me && guest >= me->stack_base && guest < me->stack_base + me->stack_size)
+                own = true;
+            wanted = wanted && !own;
+            if (wanted && logged < 64)
+                log("watch:   foreign writer: thread %u '%s' (stack %08X-%08X)", me ? me->id : 0, me ? me->name.c_str() : "host",
+                    me ? me->stack_base : 0, me ? me->stack_base + me->stack_size : 0);
+        }
         if (wanted && logged++ < 64)
             log("watch: write to %08llX in sub_%08X, lr %08llX, stack:%s", (unsigned long long)(addr - uintptr_t(g_base)),
                 kernel::guest_function_at(uintptr_t(info->ExceptionRecord->ExceptionAddress)), (unsigned long long)(ctx ? ctx->lr : 0),
@@ -217,9 +296,68 @@ namespace
         g_watch_exact = uint32_t(std::strtoul(v, nullptr, 16));
         g_watch = g_watch_exact & ~0xFFFu;
         AddVectoredExceptionHandler(1, watch_handler);
-        DWORD old;
-        VirtualProtect(g_base + g_watch, 0x1000, PAGE_READONLY, &old);
-        log("watch: page %08X", g_watch);
+        // TT2_WATCH_DELAY=seconds: start watching later (skips start-up writes such as stack setup).
+        const char* d = std::getenv("TT2_WATCH_DELAY");
+        const int delay = d ? std::atoi(d) : 0;
+        std::thread([delay] {
+            std::this_thread::sleep_for(std::chrono::seconds(delay));
+            DWORD old;
+            VirtualProtect(g_base + g_watch, 0x1000, PAGE_READONLY, &old);
+            log("watch: page %08X", g_watch);
+        }).detach();
+    }
+
+    // TT2_TIMER_SCAN=video_frame (debugging): from that frame on, find a heap word that counts
+    // down by one per frame (the round timer) and watch who writes it.
+    void start_timer_scan()
+    {
+        const char* v = std::getenv("TT2_TIMER_SCAN");
+        if (!v || !*v)
+            return;
+        const uint64_t at = std::strtoull(v, nullptr, 10);
+        std::thread([at] {
+            auto wait_frame = [](uint64_t f) {
+                while (video::frames() < f)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            };
+            wait_frame(at);
+            std::vector<std::pair<uint32_t, int32_t>> cands;
+            uint64_t f0 = video::frames();
+            for (auto [s, n] : g_memory.virt.ranges())
+                for (uint32_t a = s; a + 4 <= s + n; a += 4)
+                {
+                    const int32_t x = int32_t(load32(a));
+                    if (x >= 1000 && x <= 5000)
+                        cands.push_back({ a, x });
+                }
+            log("timer scan: %zu candidates at frame %llu", cands.size(), (unsigned long long)f0);
+            for (int pass = 0; pass < 3 && cands.size() > 1; pass++)
+            {
+                wait_frame(f0 + 60);
+                const uint64_t f1 = video::frames();
+                const int32_t step = int32_t(f1 - f0);
+                std::vector<std::pair<uint32_t, int32_t>> next;
+                for (auto [a, x] : cands)
+                {
+                    const int32_t y = int32_t(load32(a));
+                    if (x - y >= step - 3 && x - y <= step + 3)
+                        next.push_back({ a, y });
+                }
+                cands.swap(next);
+                f0 = f1;
+                log("timer scan: %zu left after %d frames", cands.size(), step);
+            }
+            for (size_t i = 0; i < cands.size() && i < 10; i++)
+                log("timer scan: %08X = %d", cands[i].first, cands[i].second);
+            if (!cands.empty())
+            {
+                g_watch_exact = cands[0].first;
+                g_watch = g_watch_exact & ~0xFFFu;
+                AddVectoredExceptionHandler(1, watch_handler);
+                DWORD old;
+                VirtualProtect(g_base + g_watch, 0x1000, PAGE_READONLY, &old);
+            }
+        }).detach();
     }
 
     // Exit code that tells the launcher to open the online lobby (the game's Back shortcut).
@@ -431,8 +569,10 @@ int main(int argc, char** argv)
     }
 
     start_watch();
+    start_timer_scan();
     log("starting the game at %08X", g_image.entry);
     auto main_thread = kernel::start_thread(g_image.entry, 0, 0, g_image.stack_size, false, "main");
+    start_profiler(main_thread);
 
     // TT2_DUMP_THREADS=<seconds>: log where every guest thread is after that long (debugging).
     if (const char* d = std::getenv("TT2_DUMP_THREADS"); d && std::atoi(d) > 0)
