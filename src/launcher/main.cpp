@@ -137,9 +137,11 @@ namespace
         return { L"--name1", widen_utf8(p1), L"--name2", widen_utf8(p2) };
     }
 
+    constexpr int kExitToLobby = 0x4C4F; // the game: Back held, open the online lobby
+
     void start_game(App& app, const std::vector<std::wstring>& extra)
     {
-        std::vector<std::wstring> args;
+        std::vector<std::wstring> args = { L"--from-launcher" };
         if (app.config.fullscreen)
             args.push_back(L"--fullscreen");
         args.insert(args.end(), extra.begin(), extra.end());
@@ -170,6 +172,7 @@ namespace
         {
             ImGui::Text("Game: %s   build %s", app.build->version.c_str(), app.build->build_id.c_str());
             ImGui::Spacing();
+            ImGui::TextDisabled("In the game, hold Back for 2 seconds to come to the online lobby.");
             if (big_button("Local versus (2 controllers)"))
                 start_game(app, name_args(app.config.name, "Player 2"));
 #ifdef TT2_WITH_LOBBY
@@ -452,8 +455,14 @@ namespace
             ImGui::TextUnformatted("The game is running.");
             return;
         }
+        const int code = app.child->exit_code();
         app.child.reset();
 #ifdef TT2_WITH_LOBBY
+        if (code == kExitToLobby && !app.relay)
+        {
+            app.screen = Screen::Lobby;
+            return;
+        }
         if (app.relay)
         {
             app.relay.reset();
@@ -467,7 +476,7 @@ namespace
     }
 }
 
-int main(int, char**)
+int main(int argc, char** argv)
 {
     App app;
     app.root = executable_dir();
@@ -479,6 +488,15 @@ int main(int, char**)
     fs::create_directories(app.native, ec);
     app.config = load_config(app.native / "launcher.json", app.root / ".env");
     refresh_build(app);
+#ifdef TT2_WITH_LOBBY
+    // --lobby: the game asked for the lobby (its Back shortcut, when it was started on its own).
+    for (int i = 1; i < argc; i++)
+        if (std::string(argv[i]) == "--lobby" && app.build)
+            app.screen = Screen::Lobby;
+#else
+    (void)argc;
+    (void)argv;
+#endif
 
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD))
         return 1;

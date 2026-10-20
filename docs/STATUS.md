@@ -110,7 +110,7 @@ every other boot on a fast PC.
 | `TT2_INSTANCE=name` | Keep hard disk, cache and saves in `native\instances\<name>` (two games on one PC) |
 | `TT2_NET_DUMP=frame,...` | Netplay: write the game's data and heaps at those frames to `native\logs` (diff two players' dumps) |
 | `TT2_NET_PREDICTION=n` | Netplay: allow `n` frames of prediction (rollback) instead of lockstep |
-| `TT2_INPUT_SCRIPT=ms=button,...` | Press player 1's buttons at fixed times after start, for unattended tests |
+| `TT2_INPUT_SCRIPT=ms=button[:hold_ms],...` | Press player 1's buttons at fixed times after start (in netplay: game frames), for unattended tests |
 
 ## Known limitations
 

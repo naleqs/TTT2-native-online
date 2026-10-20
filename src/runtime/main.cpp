@@ -28,6 +28,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <shellapi.h>
 
 #include <algorithm>
 #include <cstdarg>
@@ -221,8 +222,38 @@ namespace
         log("watch: page %08X", g_watch);
     }
 
+    // Exit code that tells the launcher to open the online lobby (the game's Back shortcut).
+    constexpr DWORD kExitToLobby = 0x4C4F;
+
+    // Holding Back for 2 seconds outside a netplay match opens the online lobby: the game closes
+    // and the launcher shows the lobby (netplay games are started from boot by the launcher).
+    // True once the button has been held long enough.
+    bool lobby_shortcut_held()
+    {
+        using Clock = std::chrono::steady_clock;
+        static Clock::time_point since{};
+        static bool holding = false;
+        if (netglue::active())
+            return false;
+        bool back = false;
+        for (int port = 0; port < 2; port++)
+            back = back || (input::read(port).buttons & 0x0020) != 0;
+        if (!back)
+        {
+            holding = false;
+            return false;
+        }
+        if (!holding)
+        {
+            holding = true;
+            since = Clock::now();
+        }
+        return Clock::now() - since >= std::chrono::seconds(2);
+    }
+
     struct CommandLine
     {
+        bool from_launcher = false;     // started by the launcher (it opens the lobby on kExitToLobby)
         bool fullscreen = false;
         netglue::Options net;
     };
@@ -236,6 +267,8 @@ namespace
             auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
             if (a == "--fullscreen")
                 c.fullscreen = true;
+            else if (a == "--from-launcher")
+                c.from_launcher = true;
             else if (a == "--netplay")
                 c.net.enabled = true;
             else if (a == "--player")
@@ -408,6 +441,7 @@ int main(int argc, char** argv)
             kernel::dump_threads();
         }).detach();
 
+    DWORD exit_code = 0;
     bool running = true;
     while (running)
     {
@@ -428,6 +462,21 @@ int main(int argc, char** argv)
             log("the game's main thread exited (code %u)", main_thread->exit_code);
             running = false;
         }
+        if (lobby_shortcut_held())
+        {
+            log("Back held: leaving for the online lobby");
+            if (!cmd.from_launcher)
+            {
+                // Started on its own: start the launcher in the lobby.
+                const fs::path launcher = native.parent_path() / "TTT2 Native Online.exe";
+                if (fs::exists(launcher))
+                    ShellExecuteW(nullptr, L"open", launcher.c_str(), L"--lobby", native.parent_path().c_str(), SW_SHOWNORMAL);
+                else
+                    log("no launcher at %s", launcher.string().c_str());
+            }
+            exit_code = kExitToLobby;
+            running = false;
+        }
     }
 
     netglue::shutdown();
@@ -435,5 +484,5 @@ int main(int argc, char** argv)
     if (g_log_file)
         fflush(g_log_file);
     // Guest threads cannot be joined safely; end the process.
-    ExitProcess(0);
+    ExitProcess(exit_code);
 }

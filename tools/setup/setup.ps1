@@ -473,7 +473,9 @@ try {
 
     $minutes = [int]((Get-Date) - $started).TotalMinutes
     Write-Log ''
-    Write-Log "Done in $minutes min. The launcher will now start the native game." 'Green'
+    Write-Log "Done in $minutes min." 'Green'
+    Write-Log "Start 'TTT2 Native Online.exe' (in this folder) to play: local versus, the online lobby and direct connect are there." 'Green'
+    Write-Log "The game's own Online Mode menu is Xbox Live and does not work; online play goes through the launcher." 'Green'
 }
 catch {
     if (-not $script:Reported) { Write-Log "ERROR: $($_.Exception.Message)" 'Red' }

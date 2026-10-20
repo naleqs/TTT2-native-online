@@ -27,12 +27,13 @@ namespace tt2::input
         bool g_debug_keyboard = false;
 
         // TT2_INPUT_SCRIPT=ms=button[,ms=button...]: press player 1's buttons (150 ms each) at
-        // fixed times after start, for unattended test runs. Buttons: a b x y start back up down
-        // left right lb rb.
+        // fixed times after start, for unattended test runs (ms=button:duration to hold longer).
+        // Buttons: a b x y start back up down left right lb rb.
         struct ScriptedPress
         {
             int64_t at_ms;
             uint16_t bit;
+            int64_t duration_ms;
         };
         std::vector<ScriptedPress> g_script;
         std::chrono::steady_clock::time_point g_start;
@@ -52,9 +53,19 @@ namespace tt2::input
                 const std::string item = spec.substr(pos, end - pos);
                 const size_t eq = item.find('=');
                 if (eq != std::string::npos)
+                {
+                    // ms=button or ms=button:duration_ms (default 150)
+                    std::string button = item.substr(eq + 1);
+                    int64_t duration = 150;
+                    if (const size_t colon = button.find(':'); colon != std::string::npos)
+                    {
+                        duration = std::atoll(button.c_str() + colon + 1);
+                        button.resize(colon);
+                    }
                     for (auto& [name, bit] : names)
-                        if (item.substr(eq + 1) == name)
-                            g_script.push_back({ std::atoll(item.c_str()), bit });
+                        if (button == name)
+                            g_script.push_back({ std::atoll(item.c_str()), bit, duration });
+                }
                 pos = end + 1;
             }
             g_start = std::chrono::steady_clock::now();
@@ -68,7 +79,7 @@ namespace tt2::input
             if (const int frame = netglue::frame(nullptr); frame >= 0)
                 now = int64_t(frame) * 1000 / 60;
             for (const ScriptedPress& p : g_script)
-                if (now >= p.at_ms && now < p.at_ms + 150)
+                if (now >= p.at_ms && now < p.at_ms + p.duration_ms)
                     s.buttons |= p.bit;
             s.connected = true;
         }

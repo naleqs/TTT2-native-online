@@ -97,6 +97,11 @@ frame: about 0.07 ms per save and 0.2 ms per load in the game.
 
 ## Lobby (`src/netplay/src/lobby.cpp`)
 
+- Players open it from the launcher's home screen, or from the game: holding **Back** for
+  2 seconds outside a netplay match closes the game and opens the lobby (exit code `0x4C4F` when
+  the launcher started the game; otherwise the game starts the launcher with `--lobby`). The
+  game's own Online Mode menu is Xbox Live and stays disabled.
+
 - The room hash is `sha1("ttt2-native-online/" + build_id + "/" + room)`, truncated to 20
   characters. Only players with the same build and room can meet.
 - Each client announces itself to the trackers with 4 pre-gathered WebRTC offers. A tracker
