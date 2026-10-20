@@ -24,6 +24,11 @@
 using namespace tt2;
 using namespace tt2::kernel;
 
+namespace tt2::game
+{
+    extern std::atomic<uint64_t> g_loop_iterations;
+}
+
 namespace tt2::video
 {
     namespace
@@ -275,6 +280,23 @@ namespace tt2::video
                     const uint32_t frontbuffer = r.read(), width = r.read(), height = r.read();
                     gpu::on_frame_end();
                     gpu::renderer::swap(frontbuffer, width, height);
+                    // TT2_LATENCY=1: how many frames the game has issued beyond the one presented.
+                    static const bool latency = [] { const char* v = std::getenv("TT2_LATENCY"); return v && *v == '1'; }();
+                    static uint64_t presented = 0, sum = 0, worst = 0;
+                    if (latency)
+                    {
+                        presented++;
+                        const uint64_t ahead = g_frames.load() > presented ? g_frames.load() - presented : 0;
+                        sum += ahead;
+                        worst = std::max(worst, ahead);
+                        if (presented % 300 == 0)
+                        {
+                            log("latency: game issued %llu frames, presented %llu; frames in flight avg %.2f, worst %llu; main loop iterations %llu",
+                                (unsigned long long)g_frames.load(), (unsigned long long)presented, double(sum) / 300.0, (unsigned long long)worst,
+                                (unsigned long long)game::g_loop_iterations.load());
+                            sum = worst = 0;
+                        }
+                    }
                 }
                 break;
             case 0x2D: // SET_CONSTANT: offset_type, values

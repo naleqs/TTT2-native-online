@@ -8,6 +8,7 @@
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
+#include <dxgi1_5.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -117,6 +118,7 @@ namespace tt2::gpu::renderer
         ComPtr<ID3D11DeviceContext1> g_ctx1;
         ComPtr<IDXGISwapChain1> g_swapchain;
         uint32_t g_backbuffer_w = 0, g_backbuffer_h = 0;
+        bool g_tearing = false; // swap chain created with DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
         D3DCompileFn g_compile = nullptr;
 
         constexpr UINT kCompileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL1;
@@ -2171,6 +2173,20 @@ float4 ps_text(BlitOut i) : SV_Target
         sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         sd.BufferCount = 2;
         sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        // Tearing allowed: a presented frame goes to the screen right away instead of waiting for
+        // the desktop compositor's next refresh (about a frame less input lag; the game paces
+        // itself to 60 fps). TT2_VSYNC=1 turns it off.
+        {
+            ComPtr<IDXGIFactory5> f5;
+            BOOL tearing = FALSE;
+            const char* vs = std::getenv("TT2_VSYNC");
+            if ((!vs || *vs != '1') && SUCCEEDED(factory.As(&f5)) &&
+                SUCCEEDED(f5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing))) && tearing)
+            {
+                sd.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+                g_tearing = true;
+            }
+        }
         if (FAILED(factory->CreateSwapChainForHwnd(g_device.Get(), g_hwnd, &sd, nullptr, nullptr, &g_swapchain)))
         {
             log("renderer: cannot create the swap chain");
@@ -2340,7 +2356,7 @@ float4 ps_text(BlitOut i) : SV_Target
         if (w != g_backbuffer_w || h != g_backbuffer_h)
         {
             g_ctx->ClearState();
-            if (SUCCEEDED(g_swapchain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0)))
+            if (SUCCEEDED(g_swapchain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, g_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0)))
             {
                 g_backbuffer_w = w;
                 g_backbuffer_h = h;
@@ -2400,6 +2416,6 @@ float4 ps_text(BlitOut i) : SV_Target
         if ((g_screenshot_interval && g_frame % g_screenshot_interval == 0) || g_frame == g_dump_frame)
             screenshot(back.Get());
         g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
-        g_swapchain->Present(0, 0);
+        g_swapchain->Present(0, g_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
     }
 }

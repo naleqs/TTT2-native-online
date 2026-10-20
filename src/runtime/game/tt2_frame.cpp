@@ -30,11 +30,19 @@
 // boundary, the counterpart of Tekken6-rollback's task-walk hook.
 
 #include "../guest.h"
+
+#include <atomic>
 #include "../rollback/game_rollback.h"
+
+namespace tt2::game
+{
+    std::atomic<uint64_t> g_loop_iterations{ 0 }; // main loop iterations (latency diagnostics)
+}
 
 #if TT2_TU3
 void Tt2FrameBoundary(PPCRegister& r20, PPCRegister& r21, PPCRegister& r26, PPCRegister& r27, PPCRegister& r30)
 {
+    tt2::game::g_loop_iterations++;
     tt2::rollback::frame_boundary({ { r21.u32, r20.u32, r26.u32, r30.u32, r27.u32 } });
 }
 #else

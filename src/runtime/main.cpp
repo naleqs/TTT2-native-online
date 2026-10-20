@@ -596,7 +596,7 @@ int main(int argc, char** argv)
         if (renderer)
             draw_placeholder(renderer, video::frames(), netglue::status_line());
         else
-            SDL_Delay(4);
+            SDL_Delay(1); // controllers are polled every millisecond (the game reads them at frame start)
         if (main_thread->exited)
         {
             log("the game's main thread exited (code %u)", main_thread->exit_code);

@@ -96,6 +96,8 @@ every other boot on a fast PC.
 | `TT2_LOG_NAME=file` | Log file name in `native\logs` (two instances on one PC) |
 | `TT2_GPU_STATS=1` | Every 120 frames, log the frame's draws, resolves, primitive types and render target setup |
 | `TT2_SCREENSHOT=N` | Save the presented picture every N frames to `native\screenshots` (PNG) |
+| `TT2_VSYNC=1` | Wait for the display refresh when presenting (default: tearing allowed, about a frame less input lag) |
+| `TT2_LATENCY=1` | Every 300 frames, log frames issued vs presented and main loop iterations |
 | `TT2_SHOW_FPS=0` | Hide the frames-per-second counter (top right; shown by default) |
 | `TT2_LOG_IO=1` | Log every file the game opens and the result |
 | `TT2_DLC=0` | Hide the installed DLC from the game |
