@@ -5,8 +5,8 @@
 //
 // EDRAM is modelled as one host render target per (EDRAM base, format, pitch). A resolve copies
 // a render target rectangle into a host texture kept for the destination address, which later
-// texture fetches of that address and the front buffer use directly (resolved data is not
-// written back to guest memory).
+// texture fetches of that address and the front buffer use directly. Resolved data reaches
+// guest memory only when the CPU reads it through the 0xC0000000 view (see write_back_fault).
 
 #include <cstdint>
 #include <filesystem>

@@ -24,6 +24,7 @@ namespace tt2::lobby
     {
         std::string build_id;                 // from native/bin/build-info.json
         std::string display_name = "Player";
+        std::string avatar_png;               // small PNG (profile picture), sent to other players; may be empty
         std::string room = "public";          // private rooms: any shared word
         std::vector<std::string> trackers;    // wss:// WebTorrent trackers
         std::vector<std::string> ice_servers; // stun:host:port, turn:user:pass@host:port
@@ -43,6 +44,7 @@ namespace tt2::lobby
         std::string name;
         PeerStatus status = PeerStatus::Idle;
         int ping_ms = -1;
+        std::string avatar_png;               // their profile picture (PNG bytes), empty if none
     };
 
     enum class EventType

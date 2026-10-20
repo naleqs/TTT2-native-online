@@ -31,6 +31,9 @@ namespace tt2::netglue
     // XamInputGetState: true when netplay supplies this port's state.
     bool input_for_port(int port, input::PadState& out);
 
+    // The frame being simulated with intercepted inputs, or -1 (see rollback::current_frame).
+    int frame(uint64_t* serial);
+
     // VdSwap: a frame was presented.
     void on_present();
 

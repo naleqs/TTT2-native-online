@@ -379,6 +379,7 @@ namespace
             l.recursion++;
             return;
         }
+        BlockedScope blocked;
         g_locks_cv.wait(lock, [&] { return l.owner == 0; });
         l.owner = me;
         l.recursion = 1;

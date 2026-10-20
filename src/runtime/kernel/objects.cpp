@@ -1,5 +1,6 @@
 #include "objects.h"
 #include "../memory.h"
+#include "threads.h"
 
 #include <thread>
 #include <unordered_map>
@@ -40,6 +41,7 @@ namespace tt2::kernel
     void block_until(const std::function<bool()>& ready)
     {
         std::unique_lock lock(g_mutex);
+        BlockedScope blocked;
         g_cv.wait(lock, ready);
     }
 
@@ -232,6 +234,7 @@ namespace tt2::kernel
                     if (t->armed && t->due < until)
                         until = t->due;
                 }
+            BlockedScope blocked;
             g_cv.wait_until(lock, until);
         }
     }

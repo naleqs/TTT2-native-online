@@ -1,0 +1,146 @@
+Jump tables switch on the low 32 bits of the index register (the guest bounds-checks it
+with cmplwi; stale upper bits fell into __builtin_unreachable, a trap). Also implements
+vupkd3d128 float16_2/float16_4, vpkd3d128 float16_2 and vcmpbfp(128), which were traps.
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -609,7 +609,7 @@
+     case PPC_INST_BCTR:
+         if (switchTable != config.switchTables.end())
+         {
+-            println("\tswitch ({}.u64) {{", r(switchTable->second.r));
++            println("\tswitch ({}.u32) {{", r(switchTable->second.r));
+ 
+             for (size_t i = 0; i < switchTable->second.labels.size(); i++)
+             {
+@@ -1836,7 +1836,19 @@
+ 
+     case PPC_INST_VCMPBFP:
+     case PPC_INST_VCMPBFP128:
+-        println("\t__builtin_debugtrap();");
++        // Bounds compare: bit 31 set if a > b, bit 30 set if a < -b (both for NaN).
++        printSetFlushMode(true);
++        for (size_t i = 0; i < 4; i++)
++            println("\t{}.u32[{}] = ({}.f32[{}] <= {}.f32[{}] ? 0u : 0x80000000u) | ({}.f32[{}] >= -{}.f32[{}] ? 0u : 0x40000000u);",
++                vTemp(), i, v(insn.operands[1]), i, v(insn.operands[2]), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
++        println("\t{} = {};", v(insn.operands[0]), vTemp());
++        if (strchr(insn.opcode->name, '.'))
++        {
++            println("\t{}.lt = 0;", cr(6));
++            println("\t{}.gt = 0;", cr(6));
++            println("\t{}.eq = ({}.u32[0] | {}.u32[1] | {}.u32[2] | {}.u32[3]) == 0;", cr(6), v(insn.operands[0]), v(insn.operands[0]), v(insn.operands[0]), v(insn.operands[0]));
++            println("\t{}.so = 0;", cr(6));
++        }
+         break;
+ 
+     case PPC_INST_VCMPEQFP:
+@@ -2021,8 +2033,19 @@
+             println("\t{}.u32[{}] = {}.u32;", v(insn.operands[0]), insn.operands[4], temp());
+             break;
+ 
++        case 3: // float16_2: (half(x) << 16) | half(y) into word `shift` (pack 1 = 32 bits)
++            if (insn.operands[3] != 1)
++            {
++                fmt::println("Unexpected float16_2 pack instruction at {:X}", base);
++                println("\t__builtin_debugtrap();");
++                break;
++            }
++            println("\t{}.u32 = (uint32_t(ppc_float_to_half({}.u32[3])) << 16) | ppc_float_to_half({}.u32[2]);", temp(), v(insn.operands[1]), v(insn.operands[1]));
++            println("\t{}.u32[{}] = {}.u32;", v(insn.operands[0]), insn.operands[4], temp());
++            break;
++
+         case 5: // float16_4
+-            if (insn.operands[3] != 2 || insn.operands[4] > 2)
++            if ((insn.operands[3] != 2 && insn.operands[3] != 3) || insn.operands[4] > 2)
+                 fmt::println("Unexpected float16_4 pack instruction at {:X}", base);
+ 
+             for (size_t i = 0; i < 4; i++)
+@@ -2568,6 +2591,20 @@
+             }
+             println("\t{}.f32[1] = 0.0f;", vTemp());
+             println("\t{}.f32[0] = 1.0f;", vTemp());
++            println("\t{} = {};", v(insn.operands[0]), vTemp());
++            break;
++
++        case 3: // float16_2: halves 6 and 7 -> x, y; z = 0, w = 1
++            println("\t{}.f32[3] = ppc_half_to_float({}.u16[1]);", vTemp(), v(insn.operands[1]));
++            println("\t{}.f32[2] = ppc_half_to_float({}.u16[0]);", vTemp(), v(insn.operands[1]));
++            println("\t{}.f32[1] = 0.0f;", vTemp());
++            println("\t{}.f32[0] = 1.0f;", vTemp());
++            println("\t{} = {};", v(insn.operands[0]), vTemp());
++            break;
++
++        case 5: // float16_4: halves 4..7 -> x, y, z, w
++            for (size_t i = 0; i < 4; i++)
++                println("\t{}.f32[{}] = ppc_half_to_float({}.u16[{}]);", vTemp(), i, v(insn.operands[1]), i);
+             println("\t{} = {};", v(insn.operands[0]), vTemp());
+             break;
+ 
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -143,6 +143,63 @@
+     uint8_t ov;
+     uint8_t ca;
+ };
++
++// VMX128 half floats (vpkd3d128 / vupkd3d128).
++inline float ppc_half_to_float(uint16_t h) noexcept
++{
++    const uint32_t sign = uint32_t(h & 0x8000) << 16;
++    uint32_t exponent = (h >> 10) & 0x1F, mantissa = h & 0x3FF, bits;
++    if (exponent == 0)
++    {
++        if (mantissa == 0)
++        {
++            bits = sign;
++        }
++        else
++        {
++            exponent = 113;
++            while (!(mantissa & 0x400))
++            {
++                mantissa <<= 1;
++                exponent--;
++            }
++            bits = sign | (exponent << 23) | ((mantissa & 0x3FF) << 13);
++        }
++    }
++    else if (exponent == 31)
++    {
++        bits = sign | 0x7F800000 | (mantissa << 13);
++    }
++    else
++    {
++        bits = sign | ((exponent + 112) << 23) | (mantissa << 13);
++    }
++    float f;
++    memcpy(&f, &bits, sizeof(f));
++    return f;
++}
++
++// Same conversion as the float16_4 pack: truncating, NaN and |x| > 65504 become 0x7FFF.
++inline uint16_t ppc_float_to_half(uint32_t bits) noexcept
++{
++    const uint32_t magnitude = bits & 0x7FFFFFFF;
++    float f;
++    memcpy(&f, &magnitude, sizeof(f));
++    uint16_t h;
++    if (f != f || f > 65504.0f)
++    {
++        h = 0x7FFF;
++    }
++    else
++    {
++        const uint32_t exponent = magnitude >> 23, mantissa = (magnitude & 0x7FE000) >> 13;
++        if (exponent > 0x70)
++            h = uint16_t(((exponent - 0x70) << 10) + mantissa);
++        else
++            h = 0x71 - exponent > 31 ? 0 : uint16_t((0x400 + mantissa) >> (0x71 - exponent));
++    }
++    return uint16_t(h | ((bits & 0x80000000) >> 16));
++}
+ 
+ struct PPCCRRegister
+ {

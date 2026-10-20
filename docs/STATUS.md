@@ -42,10 +42,15 @@ Last updated: 2026-10-17, version 0.1.0.
 
 ## Known issues
 
-- **No sync point yet.** Both players' games must start rolling back from the same game state.
-  Netplay currently starts at the first frame (boot), but boot involves asynchronous loading, so
-  the two games can drift apart before a fight. Tekken6-rollback starts at the fight; the TTT2
-  equivalent (fight start/end detection) still has to be found.
+- **Netplay runs in lockstep from boot** (no rollback yet: menus lose inputs when rolled back).
+  Menus, VS character select and stage select stay identical on both PCs. Random choices (random
+  stage, intro animations) still differ, so a VS match currently needs a fixed stage, and the
+  fights themselves are not yet confirmed to stay in sync. Next: find the state those random
+  numbers come from (two counters differ by one frame between the PCs), then fight start
+  detection to turn rollback on in fights.
+- **Occasional crash in controller-slot code** (`sub_8241ABC0`/`sub_82420C40`, a slot pointer of
+  -1). Netplay's player 2 sign-in mismatch was one cause and is fixed; it has also been seen once
+  without netplay.
 - **No desync detection in the game yet.** The session supports checksums, but the per-frame
   memory hash also includes presentation pages, so it is turned off.
 - Some intro or attract sequences use a movie player with its own threads. They survive rollback
@@ -91,12 +96,21 @@ every other boot on a fast PC.
 | `TT2_LOG_NAME=file` | Log file name in `native\logs` (two instances on one PC) |
 | `TT2_GPU_STATS=1` | Every 120 frames, log the frame's draws, resolves, primitive types and render target setup |
 | `TT2_SCREENSHOT=N` | Save the presented picture every N frames to `native\screenshots` (PNG) |
+| `TT2_SHOW_FPS=0` | Hide the frames-per-second counter (top right; shown by default) |
 | `TT2_LOG_IO=1` | Log every file the game opens and the result |
 | `TT2_DLC=0` | Hide the installed DLC from the game |
 | `TT2_DEBUG_KEYBOARD=1` | The keyboard acts as player 1's pad (arrows, Enter = Start, Z/X/A/S = A/B/X/Y), for test scripts |
 | `TT2_RENDERER=null` | Don't draw; show the placeholder screen |
 | `TT2_D3D_DEBUG=1` | Direct3D debug layer (needs the Graphics Tools Windows feature) |
 | `TT2_DUMP_SHADERS=1` | Write every shader the game loads to `native\gpu\shaders`; check them with `tt2_shader_check <dir>` |
+| `TT2_GPU_DUMP_FRAME=N` | Log every draw, texture, constant and resolve of frame N, with a thumbnail after each draw, to `native\gpu\dump` |
+| `TT2_GPU_DUMP_ON_RESOLVE=hex` | Dump the frame after a resolve to that address instead (`TT2_GPU_DUMP_NTH`: the Nth burst, `TT2_GPU_DUMP_DELAY`: frames later) |
+| `TT2_GPU_PICK=x,y` | With a dump: log every draw that changes that pixel of its render target |
+| `TT2_WATCH=hex` | Log the guest functions that write that page of guest memory (an unaligned address: only writes to its 16 bytes) |
+| `TT2_INSTANCE=name` | Keep hard disk, cache and saves in `native\instances\<name>` (two games on one PC) |
+| `TT2_NET_DUMP=frame,...` | Netplay: write the game's data and heaps at those frames to `native\logs` (diff two players' dumps) |
+| `TT2_NET_PREDICTION=n` | Netplay: allow `n` frames of prediction (rollback) instead of lockstep |
+| `TT2_INPUT_SCRIPT=ms=button,...` | Press player 1's buttons at fixed times after start, for unattended tests |
 
 ## Known limitations
 

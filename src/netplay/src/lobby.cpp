@@ -17,6 +17,58 @@
 namespace tt2::lobby
 {
     using json = nlohmann::json;
+
+    // Profile pictures travel as base64 inside the JSON control messages.
+    std::string base64_encode(const std::string& in)
+    {
+        static const char* t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string out;
+        out.reserve((in.size() + 2) / 3 * 4);
+        for (size_t i = 0; i < in.size(); i += 3)
+        {
+            uint32_t v = uint32_t(uint8_t(in[i])) << 16;
+            if (i + 1 < in.size())
+                v |= uint32_t(uint8_t(in[i + 1])) << 8;
+            if (i + 2 < in.size())
+                v |= uint8_t(in[i + 2]);
+            out += t[(v >> 18) & 63];
+            out += t[(v >> 12) & 63];
+            out += i + 1 < in.size() ? t[(v >> 6) & 63] : '=';
+            out += i + 2 < in.size() ? t[v & 63] : '=';
+        }
+        return out;
+    }
+
+    std::string base64_decode(const std::string& in)
+    {
+        auto value = [](char c) -> int {
+            if (c >= 'A' && c <= 'Z') return c - 'A';
+            if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+            if (c >= '0' && c <= '9') return c - '0' + 52;
+            if (c == '+') return 62;
+            if (c == '/') return 63;
+            return -1;
+        };
+        std::string out;
+        uint32_t acc = 0;
+        int bits = 0;
+        for (char c : in)
+        {
+            const int v = value(c);
+            if (v < 0)
+                continue;
+            acc = (acc << 6) | uint32_t(v);
+            bits += 6;
+            if (bits >= 8)
+            {
+                bits -= 8;
+                out += char((acc >> bits) & 0xFF);
+            }
+        }
+        return out;
+    }
+
+    constexpr size_t kMaxAvatarBytes = 64 * 1024;
     using Clock = std::chrono::steady_clock;
 
     namespace
@@ -515,8 +567,11 @@ namespace tt2::lobby
 
         void send_hello(const std::shared_ptr<Peer>& p)
         {
-            send_control(p, { { "t", "hello" }, { "name", cfg.display_name.substr(0, 24) }, { "status", status_name(status) },
-                              { "build", cfg.build_id } });
+            json hello = { { "t", "hello" }, { "name", cfg.display_name.substr(0, 24) }, { "status", status_name(status) },
+                           { "build", cfg.build_id } };
+            if (!cfg.avatar_png.empty() && cfg.avatar_png.size() <= kMaxAvatarBytes)
+                hello["avatar"] = base64_encode(cfg.avatar_png);
+            send_control(p, hello);
         }
 
         void on_control(const std::shared_ptr<Peer>& p, const std::string& text)
@@ -536,6 +591,8 @@ namespace tt2::lobby
                 }
                 if (j.contains("name"))
                     p->info.name = j.value("name", "Player").substr(0, 24);
+                if (j.contains("avatar") && j["avatar"].is_string() && j["avatar"].get_ref<const std::string&>().size() <= kMaxAvatarBytes * 4 / 3 + 4)
+                    p->info.avatar_png = base64_decode(j["avatar"].get<std::string>());
                 const std::string st = j.value("status", "idle");
                 p->info.status = st == "match" ? PeerStatus::InMatch : st == "away" ? PeerStatus::Away : PeerStatus::Idle;
                 p->info.id = p->id;

@@ -16,6 +16,8 @@ namespace tt2::netglue
 
     bool input_for_port(int port, input::PadState& out) { return rollback::input_for_port(port, out); }
 
+    int frame(uint64_t* serial) { return rollback::current_frame(serial); }
+
     void on_present() {}
 
     std::string status_line() { return rollback::status_line(); }

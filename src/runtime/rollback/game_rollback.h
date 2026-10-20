@@ -47,6 +47,11 @@ namespace tt2::rollback
     void configure_netplay(const netglue::Options& options);
     void configure_stress(int interval, int depth, int start);
 
+    // The frame being simulated while inputs are intercepted (-1 otherwise), and a number that
+    // changes every time a frame starts, live or re-run: per-frame state derived from the
+    // inputs (keystrokes) is rebuilt for each run of a frame.
+    int current_frame(uint64_t* serial);
+
     bool netplay_active();
     std::string status_line();
     void shutdown();

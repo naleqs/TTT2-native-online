@@ -106,6 +106,10 @@ namespace tt2::netplay
         // The live frame ran: the state at the start of the next frame is saved.
         void end_frame();
 
+        // Frames the session may run ahead of the remote input from now on. 0 is lockstep: a frame
+        // runs only once both inputs are confirmed, so nothing is ever rolled back.
+        void set_max_prediction(int frames);
+
         // Tells the peer we are leaving (sent a few times; the peer gets Disconnected).
         void quit();
 

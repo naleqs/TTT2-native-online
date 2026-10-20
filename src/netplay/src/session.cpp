@@ -588,6 +588,8 @@ namespace tt2::netplay
 
     void Session::end_frame() { impl_->end_frame(); }
 
+    void Session::set_max_prediction(int frames) { impl_->cfg.max_prediction = std::max(0, frames); }
+
     void Session::quit()
     {
         if (impl_->state == Impl::State::Ended)

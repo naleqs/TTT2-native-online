@@ -24,6 +24,19 @@ using namespace tt2::kernel;
 namespace tt2::xam
 {
     fs::path g_save_root; // set by main: native\save
+    fs::path g_dlc_root;  // set by main: native\dlc
+    std::string g_names[2] = { "Player 1", "Player 2" }; // gamertags (--name1/--name2 from the launcher)
+
+    // Gamertags are at most 15 characters of plain ASCII.
+    std::string gamertag(uint32_t user)
+    {
+        std::string n = user < 2 ? g_names[user] : "Player " + std::to_string(user + 1);
+        std::string out;
+        for (char c : n)
+            if (c >= 0x20 && c < 0x7F && out.size() < 15)
+                out += c;
+        return out.empty() ? "Player " + std::to_string(user + 1) : out;
+    }
 }
 
 namespace
@@ -55,7 +68,10 @@ namespace
     bool user_present(uint32_t user)
     {
         // Player 1 is always signed in (a local offline profile); player 2 when a second
-        // controller is connected.
+        // controller is connected, and always in netplay (both games must agree, whatever
+        // controllers each PC has; the XInput ports are both connected there too).
+        if (netglue::active())
+            return user < 2;
         return user == 0 || (user == 1 && input::connected_count() >= 2);
     }
 
@@ -105,7 +121,7 @@ TT2_IMPORT(XamInputGetState)
     const uint32_t user = a.u32(0) == 0xFF ? 0 : a.u32(0);
     const uint32_t state = a.u32(2);
     input::PadState s;
-    if (!netglue::input_for_port(int(user), s))
+    if (!netglue::input_for_port(int(user), s) && !netglue::active()) // netplay: ports 3-4 empty
         s = input::read(int(user));
     if (!s.connected)
         return a.ret(win32::device_not_connected);
@@ -136,7 +152,7 @@ TT2_IMPORT(XamInputSetState)
     const uint32_t user = a.u32(0) == 0xFF ? 0 : a.u32(0);
     if (const uint32_t v = a.u32(2))
         input::rumble(int(user), load16(v), load16(v + 2));
-    a.ret(input::read(int(user)).connected || netglue::active() ? win32::success : win32::device_not_connected);
+    a.ret((netglue::active() ? user < 2 : input::read(int(user)).connected) ? win32::success : win32::device_not_connected);
 }
 
 // XINPUT_CAPABILITIES: u8 Type, u8 SubType, be16 Flags, XINPUT_GAMEPAD, XINPUT_VIBRATION
@@ -145,7 +161,7 @@ TT2_IMPORT(XamInputGetCapabilities)
     Args a{ ctx };
     const uint32_t user = a.u32(0) == 0xFF ? 0 : a.u32(0);
     input::PadState s;
-    if (!netglue::input_for_port(int(user), s))
+    if (!netglue::input_for_port(int(user), s) && !netglue::active()) // netplay: ports 3-4 empty
         s = input::read(int(user));
     if (!s.connected)
         return a.ret(win32::device_not_connected);
@@ -180,6 +196,24 @@ namespace
         std::chrono::steady_clock::time_point repeat_at;
     };
     KeystrokeQueue g_keys[4];
+
+    // Netplay and rollback tests: keystrokes must not depend on real time or on how often the
+    // game polls, or the two games diverge. Each frame's events are derived from that frame's
+    // (shared) pad state and the previous frame's, with key repeat counted in frames, and are
+    // rebuilt whenever a frame runs again.
+    struct FrameKeys
+    {
+        int frame = -1;
+        uint64_t serial = 0;
+        uint16_t buttons = 0;
+        uint8_t triggers = 0;
+        uint16_t repeat_key = 0;
+        int repeat_at = 0;
+        std::vector<std::pair<uint16_t, uint16_t>> events;
+        size_t next = 0;
+    };
+    constexpr int kKeyRing = 64;
+    FrameKeys g_frame_keys[4][kKeyRing];
     std::mutex g_keys_mutex;
 
     constexpr uint16_t XINPUT_KEYSTROKE_KEYDOWN = 1, XINPUT_KEYSTROKE_KEYUP = 2, XINPUT_KEYSTROKE_REPEAT = 4;
@@ -221,6 +255,54 @@ namespace
             q.repeat_at = now + std::chrono::milliseconds(100);
         }
     }
+
+    FrameKeys& frame_keys(uint32_t user, int frame, uint64_t serial, const input::PadState& s)
+    {
+        FrameKeys& k = g_frame_keys[user][frame % kKeyRing];
+        if (k.frame == frame && k.serial == serial)
+            return k;
+        const FrameKeys& prev = g_frame_keys[user][(frame + kKeyRing - 1) % kKeyRing];
+        const bool have_prev = prev.frame == frame - 1;
+        k = FrameKeys{};
+        k.frame = frame;
+        k.serial = serial;
+        k.buttons = s.buttons;
+        k.triggers = uint8_t((s.left_trigger > 30 ? 1 : 0) | (s.right_trigger > 30 ? 2 : 0));
+        const uint16_t was = have_prev ? prev.buttons : 0;
+        const uint8_t was_triggers = have_prev ? prev.triggers : 0;
+        k.repeat_key = have_prev ? prev.repeat_key : 0;
+        k.repeat_at = have_prev ? prev.repeat_at : 0;
+        static const std::pair<uint16_t, uint16_t> buttons[] = {
+            { 0x1000, 0x5800 }, { 0x2000, 0x5801 }, { 0x4000, 0x5802 }, { 0x8000, 0x5803 },
+            { 0x0200, 0x5804 }, { 0x0100, 0x5805 },
+            { 0x0001, 0x5810 }, { 0x0002, 0x5811 }, { 0x0004, 0x5812 }, { 0x0008, 0x5813 },
+            { 0x0010, 0x5814 }, { 0x0020, 0x5815 }, { 0x0040, 0x5816 }, { 0x0080, 0x5817 },
+        };
+        auto change = [&](bool before, bool now, uint16_t vk) {
+            if (now && !before)
+            {
+                k.events.push_back({ vk, XINPUT_KEYSTROKE_KEYDOWN });
+                k.repeat_key = vk;
+                k.repeat_at = frame + 24; // 400 ms
+            }
+            else if (!now && before)
+            {
+                k.events.push_back({ vk, XINPUT_KEYSTROKE_KEYUP });
+                if (k.repeat_key == vk)
+                    k.repeat_key = 0;
+            }
+        };
+        for (auto [bit, vk] : buttons)
+            change(was & bit, k.buttons & bit, vk);
+        change(was_triggers & 1, k.triggers & 1, 0x5806);
+        change(was_triggers & 2, k.triggers & 2, 0x5807);
+        if (k.repeat_key && frame >= k.repeat_at && k.events.empty())
+        {
+            k.events.push_back({ k.repeat_key, XINPUT_KEYSTROKE_KEYDOWN | XINPUT_KEYSTROKE_REPEAT });
+            k.repeat_at = frame + 6; // 100 ms
+        }
+        return k;
+    }
 }
 
 // XamInputGetKeystrokeEx(user_index* (0xFF: any), flags, XINPUT_KEYSTROKE*)
@@ -237,17 +319,29 @@ TT2_IMPORT(XamInputGetKeystrokeEx)
         if (requested != 0xFF && requested != user)
             continue;
         input::PadState s;
-        if (!netglue::input_for_port(int(user), s))
+        if (!netglue::input_for_port(int(user), s) && !netglue::active()) // netplay: ports 3-4 empty
             s = input::read(int(user));
         if (!s.connected)
             continue;
         any_connected = true;
-        poll_keystrokes(user, s);
-        KeystrokeQueue& q = g_keys[user];
-        if (q.events.empty())
-            continue;
-        const auto [vk, flags] = q.events.front();
-        q.events.pop_front();
+        uint16_t vk = 0, flags = 0;
+        uint64_t serial = 0;
+        if (const int frame = netglue::frame(&serial); frame >= 0)
+        {
+            FrameKeys& k = frame_keys(user, frame, serial, s);
+            if (k.next >= k.events.size())
+                continue;
+            std::tie(vk, flags) = k.events[k.next++];
+        }
+        else
+        {
+            poll_keystrokes(user, s);
+            KeystrokeQueue& q = g_keys[user];
+            if (q.events.empty())
+                continue;
+            std::tie(vk, flags) = q.events.front();
+            q.events.pop_front();
+        }
         if (out)
         {
             store16(out + 0, vk);
@@ -282,7 +376,7 @@ TT2_IMPORT(XamUserGetSigninInfo)
         return a.ret(win32::no_such_user);
     store64(info, kXuidBase + user);
     store32(info + 12, 1);
-    const std::string name = user == 0 ? "Player 1" : "Player 2";
+    const std::string name = xam::gamertag(user);
     std::memcpy(g_base + info + 24, name.c_str(), name.size());
     a.ret(win32::success);
 }
@@ -302,7 +396,7 @@ TT2_IMPORT(XamUserGetName)
     Args a{ ctx };
     if (!user_present(a.u32(0)))
         return a.ret(win32::no_such_user);
-    const std::string name = a.u32(0) == 0 ? "Player 1" : "Player 2";
+    const std::string name = xam::gamertag(a.u32(0));
     const uint32_t len = a.u32(2);
     if (a.u32(1) && len)
     {
@@ -480,7 +574,7 @@ namespace
             if (const char* v = std::getenv("TT2_DLC"); v && *v == '0')
                 return list;
             std::error_code ec;
-            const fs::path root = xam::g_save_root.parent_path() / "dlc";
+            const fs::path root = xam::g_dlc_root;
             for (auto& d : fs::directory_iterator(root, ec))
             {
                 const fs::path info = d.path() / "info.json";

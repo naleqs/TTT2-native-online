@@ -685,14 +685,15 @@ float4 ps_text(BlitOut i) : SV_Target
             const uint32_t sign = (f[0] >> 2) & 3;
             const bool packed_mips = (f[5] >> 11) & 1;
 
-            if (dimension != 1)
+            if (dimension != 1 && dimension != 3)
             {
                 warn_once("texture dimension " + std::to_string(dimension) + " not supported yet");
                 return b;
             }
+            const bool cube = dimension == 3;
 
             // Render-to-texture: the resolved copy of this address.
-            if (auto it = g_resolved.find(base); it != g_resolved.end())
+            if (auto it = g_resolved.find(base); !cube && it != g_resolved.end())
             {
                 Resolved& res = it->second;
                 if (!res.surface.srv)
@@ -722,8 +723,22 @@ float4 ps_text(BlitOut i) : SV_Target
                 warn_once("texture format " + std::to_string(format) + " not supported yet");
                 return b;
             }
-            if (packed_mips && (width <= 16 || height <= 16))
-                warn_once("small textures with packed mips are not handled yet");
+            // Small textures with packed mips keep their base level in the packed mip tile:
+            // 16 pixels down (wider than tall) or across (otherwise) in the 32x32 tile (Xenia's
+            // GetPackedMipOffset).
+            uint32_t ox = 0, oy = 0;
+            if (packed_mips)
+            {
+                auto log2_ceil = [](uint32_t v) { uint32_t l = 0; while ((1u << l) < v) l++; return l; };
+                const uint32_t lw = log2_ceil(width), lh = log2_ceil(height);
+                if (std::min(lw, lh) <= 4)
+                {
+                    if (lw > lh)
+                        oy = 16 / fi.block;
+                    else
+                        ox = 16 / fi.block;
+                }
+            }
 
             const uint32_t bw = (width + fi.block - 1) / fi.block, bh = (height + fi.block - 1) / fi.block;
             const uint32_t pitch_blocks = std::max((pitch + fi.block - 1) / fi.block, bw);
@@ -733,28 +748,33 @@ float4 ps_text(BlitOut i) : SV_Target
             const uint32_t pitch_aligned = (pitch_blocks + 31) & ~31u;
             const uint32_t height_aligned = (bh + 31) & ~31u;
             const uint32_t row_bytes_linear = (pitch_blocks * fi.bytes + 255) & ~255u;
-            const uint32_t span = tiled ? pitch_aligned * height_aligned * fi.bytes : row_bytes_linear * bh;
+            const uint32_t span = tiled ? pitch_aligned * height_aligned * fi.bytes : row_bytes_linear * (bh + oy);
+            // Cube maps: six faces, each a 2D image at page-aligned strides.
+            const uint32_t faces = cube ? 6 : 1;
+            const uint32_t face_stride = (span + 4095) & ~4095u;
             const uint8_t* src = phys_ptr(base);
 
-            uint64_t key = fnv(f, sizeof(f));
+            uint64_t key = fnv(f, sizeof(f), cube ? 3 : 1);
             Texture& t = g_textures[key];
             if (t.checked_frame != g_frame)
             {
                 t.checked_frame = g_frame;
-                const uint64_t content = fnv(src, span);
+                const uint64_t content = fnv(src, size_t(face_stride) * (faces - 1) + span);
                 if (!t.surface.tex || content != t.content)
                 {
                     t.content = content;
-                    std::vector<uint8_t> linear(size_t(bw) * bh * fi.bytes);
+                    const size_t face_bytes = size_t(bw) * bh * fi.bytes;
+                    std::vector<uint8_t> linear(face_bytes * faces);
+                    for (uint32_t face = 0; face < faces; face++)
                     for (uint32_t y = 0; y < bh; y++)
                         for (uint32_t x = 0; x < bw; x++)
                         {
-                            const uint32_t off = tiled ? uint32_t(tiled_2d(int32_t(x), int32_t(y), pitch_aligned, bpb_log2))
-                                                       : y * row_bytes_linear + x * fi.bytes;
-                            uint8_t* dst = &linear[(size_t(y) * bw + x) * fi.bytes];
+                            const uint32_t off = tiled ? uint32_t(tiled_2d(int32_t(x + ox), int32_t(y + oy), pitch_aligned, bpb_log2))
+                                                       : (y + oy) * row_bytes_linear + (x + ox) * fi.bytes;
+                            uint8_t* dst = &linear[face * face_bytes + (size_t(y) * bw + x) * fi.bytes];
                             if (off + fi.bytes > span)
                                 continue;
-                            std::memcpy(dst, src + off, fi.bytes);
+                            std::memcpy(dst, src + size_t(face) * face_stride + off, fi.bytes);
                             if (fi.bytes >= 4)
                                 for (uint32_t i = 0; i < fi.bytes; i += 4)
                                 {
@@ -775,14 +795,17 @@ float4 ps_text(BlitOut i) : SV_Target
                         d.Height = (height + 3) & ~3u;
                     }
                     d.MipLevels = 1;
-                    d.ArraySize = 1;
+                    d.ArraySize = faces;
                     d.Format = fi.format;
                     d.SampleDesc.Count = 1;
                     d.Usage = D3D11_USAGE_DEFAULT;
                     d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-                    D3D11_SUBRESOURCE_DATA init{ linear.data(), bw * fi.bytes, 0 };
+                    d.MiscFlags = cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
+                    D3D11_SUBRESOURCE_DATA init[6];
+                    for (uint32_t face = 0; face < faces; face++)
+                        init[face] = { linear.data() + face * face_bytes, bw * fi.bytes, 0 };
                     t.surface = Surface{};
-                    if (SUCCEEDED(g_device->CreateTexture2D(&d, &init, &t.surface.tex)))
+                    if (SUCCEEDED(g_device->CreateTexture2D(&d, init, &t.surface.tex)))
                         g_device->CreateShaderResourceView(t.surface.tex.Get(), nullptr, &t.surface.srv);
                     std::memcpy(t.map, fi.map, 4);
                 }
@@ -830,6 +853,48 @@ float4 ps_text(BlitOut i) : SV_Target
 
         void save_srv(ID3D11ShaderResourceView* srv, uint32_t w, uint32_t h, const std::string& name, uint32_t region_w = 0, uint32_t region_h = 0);
         uint32_t g_dump_draw = 0;
+
+        // TT2_GPU_PICK=x,y (with TT2_GPU_DUMP_FRAME): log every draw of the dumped frame that
+        // changes that pixel of its first render target, with the pixel's raw value.
+        int32_t g_pick_x = -1, g_pick_y = -1;
+
+        void pick(ID3D11Resource* res)
+        {
+            if (g_pick_x < 0)
+                return;
+            ComPtr<ID3D11Texture2D> tex;
+            if (FAILED(res->QueryInterface(IID_PPV_ARGS(&tex))))
+                return;
+            D3D11_TEXTURE2D_DESC d;
+            tex->GetDesc(&d);
+            if (uint32_t(g_pick_x) >= d.Width || uint32_t(g_pick_y) >= d.Height)
+                return;
+            D3D11_TEXTURE2D_DESC s{};
+            s.Width = s.Height = 1;
+            s.MipLevels = s.ArraySize = 1;
+            s.Format = d.Format;
+            s.SampleDesc.Count = 1;
+            s.Usage = D3D11_USAGE_STAGING;
+            s.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            ComPtr<ID3D11Texture2D> staging;
+            if (FAILED(g_device->CreateTexture2D(&s, nullptr, &staging)))
+                return;
+            const D3D11_BOX box{ UINT(g_pick_x), UINT(g_pick_y), 0, UINT(g_pick_x + 1), UINT(g_pick_y + 1), 1 };
+            g_ctx->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, tex.Get(), 0, &box);
+            D3D11_MAPPED_SUBRESOURCE m;
+            if (FAILED(g_ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m)))
+                return;
+            uint64_t v = 0;
+            std::memcpy(&v, m.pData, 8);
+            g_ctx->Unmap(staging.Get(), 0);
+            static std::map<ID3D11Resource*, uint64_t> last;
+            auto [it, fresh] = last.try_emplace(res, ~v);
+            if (it->second != v)
+            {
+                it->second = v;
+                log("dump:   pick draw %u: target %p format %u value %016llX", g_dump_draw, (void*)res, unsigned(d.Format), (unsigned long long)v);
+            }
+        }
         std::set<ID3D11ShaderResourceView*> g_dumped_textures;
 
         // ------------------------------------------------------------------ fixed function state
@@ -968,6 +1033,116 @@ float4 ps_text(BlitOut i) : SV_Target
             y1 = std::max(y1, y0);
         }
 
+        // Resolves normally stay on the host: the game samples them as textures, which finds the
+        // host copy. A few it reads back with the CPU instead: the costume textures are composited
+        // on the GPU (over several frames), read through the 0xC0000000 view of physical memory
+        // and compressed to DXT by the CPU. Reading back every resolve would stall the GPU every
+        // frame, so the copy is lazy: after a resolve, the destination's pages in the 0xC0000000
+        // view are made inaccessible, and the first CPU access there (a fault) copies the latest
+        // resolved picture into guest memory. Post-processing targets are never touched by the CPU
+        // and never cost anything.
+        constexpr uint32_t kCachedView = 0xC0000000;
+        std::recursive_mutex g_lock; // the device context: GPU thread vs. a faulting CPU thread
+
+        struct PendingWriteBack
+        {
+            Resolved* res;
+            int32_t x0, y0, x1, y1;
+            uint32_t bytes, pitch, endian, format;
+            bool swap;
+        };
+        std::map<uint32_t, PendingWriteBack> g_pending; // by destination (physical)
+        std::mutex g_pending_mutex;
+
+        void write_back(uint32_t dest, const PendingWriteBack& w)
+        {
+            Resolved& res = *w.res;
+            const DXGI_FORMAT f = res.surface.format;
+            if ((w.format != 6 && w.format != 0) || (f != DXGI_FORMAT_R8G8B8A8_UNORM && f != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) || w.x1 <= w.x0 ||
+                w.y1 <= w.y0 || !res.surface.tex)
+            {
+                warn_once("resolve write-back of format " + std::to_string(w.format) + " not supported yet");
+                return;
+            }
+            D3D11_TEXTURE2D_DESC d{};
+            d.Width = UINT(w.x1 - w.x0);
+            d.Height = UINT(w.y1 - w.y0);
+            d.MipLevels = d.ArraySize = 1;
+            d.Format = f;
+            d.SampleDesc.Count = 1;
+            d.Usage = D3D11_USAGE_STAGING;
+            d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            ComPtr<ID3D11Texture2D> staging;
+            if (FAILED(g_device->CreateTexture2D(&d, nullptr, &staging)))
+                return;
+            const D3D11_BOX box{ UINT(w.x0), UINT(w.y0), 0, UINT(w.x1), UINT(w.y1), 1 };
+            g_ctx->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, res.surface.tex.Get(), 0, &box);
+            D3D11_MAPPED_SUBRESOURCE m;
+            if (FAILED(g_ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m)))
+                return;
+            // A tiled 2D surface in the destination format, as the GPU would have written it.
+            uint8_t* view = g_base + (kCachedView | dest);
+            for (int32_t y = w.y0; y < w.y1; y++)
+            {
+                const uint8_t* row = static_cast<const uint8_t*>(m.pData) + size_t(y - w.y0) * m.RowPitch;
+                for (int32_t x = w.x0; x < w.x1; x++)
+                {
+                    const uint8_t* px = row + size_t(x - w.x0) * 4;
+                    // k_8_8_8_8: X in the low byte; the swap flag exchanges X and Z.
+                    const uint32_t rr = w.swap ? px[2] : px[0], bb = w.swap ? px[0] : px[2];
+                    const uint32_t v = gpu_swap(rr | uint32_t(px[1]) << 8 | bb << 16 | uint32_t(px[3]) << 24, w.endian);
+                    std::memcpy(view + uint32_t(tiled_2d(x, y, w.pitch, 2)), &v, 4);
+                }
+            }
+            g_ctx->Unmap(staging.Get(), 0);
+            static int logged = 0;
+            if (logged++ < 20)
+                log("renderer: resolve %08X (%dx%d) copied to guest memory on CPU access", dest, w.x1 - w.x0, w.y1 - w.y0);
+        }
+
+        // After a colour resolve: arm the lazy copy for its destination.
+        void arm_write_back(Resolved& res, uint32_t dest, int32_t x0, int32_t y0, int32_t x1, int32_t y1)
+        {
+            const uint32_t info = r(RB_COPY_DEST_INFO);
+            PendingWriteBack w{ &res, x0, y0, x1, y1, 0, 0, info & 7, (info >> 7) & 0x3F, ((info >> 24) & 1) != 0 };
+            if (w.format != 6 && w.format != 0)
+                return;
+            w.pitch = std::max(((r(RB_COPY_DEST_PITCH) & 0x3FFF) + 31) & ~31u, (res.width + 31) & ~31u);
+            w.bytes = (w.pitch * ((uint32_t(y1) + 31) & ~31u) * 4 + 0xFFF) & ~0xFFFu;
+            if (dest + w.bytes > 0x20000000)
+                return;
+            std::lock_guard lock(g_pending_mutex);
+            g_pending[dest] = w;
+            DWORD old;
+            VirtualProtect(g_base + (kCachedView | dest), w.bytes, PAGE_NOACCESS, &old);
+        }
+
+        LONG CALLBACK write_back_fault(EXCEPTION_POINTERS* info)
+        {
+            if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || info->ExceptionRecord->NumberParameters < 2 || !g_base)
+                return EXCEPTION_CONTINUE_SEARCH;
+            const uintptr_t addr = info->ExceptionRecord->ExceptionInformation[1];
+            const uintptr_t lo = uintptr_t(g_base) + kCachedView, hi = lo + 0x20000000;
+            if (addr < lo || addr >= hi)
+                return EXCEPTION_CONTINUE_SEARCH;
+            const uint32_t phys = uint32_t(addr - lo);
+            std::lock_guard gpu(g_lock);
+            std::lock_guard lock(g_pending_mutex);
+            auto it = g_pending.upper_bound(phys);
+            if (it == g_pending.begin())
+                return EXCEPTION_CONTINUE_SEARCH;
+            --it;
+            if (phys >= it->first + it->second.bytes)
+                return EXCEPTION_CONTINUE_SEARCH;
+            const uint32_t dest = it->first;
+            const PendingWriteBack w = it->second;
+            g_pending.erase(it);
+            DWORD old;
+            VirtualProtect(g_base + (kCachedView | dest), w.bytes, PAGE_READWRITE, &old);
+            write_back(dest, w);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
         void resolve()
         {
             const uint32_t control = r(RB_COPY_CONTROL);
@@ -1050,11 +1225,30 @@ float4 ps_text(BlitOut i) : SV_Target
                         g_device->CreateRenderTargetView(res.surface.tex.Get(), nullptr, &res.surface.rtv);
                 }
                 res.frame = g_frame;
+                // TT2_GPU_DUMP_ON_RESOLVE=<dest hex>: dump the frame after a resolve there (the Nth burst of
+                // them with TT2_GPU_DUMP_NTH, TT2_GPU_DUMP_DELAY frames later).
+                static const uint32_t dump_on = [] { const char* v = std::getenv("TT2_GPU_DUMP_ON_RESOLVE"); return v ? uint32_t(std::strtoul(v, nullptr, 16)) : 0u; }();
+                static const int dump_nth = [] { const char* v = std::getenv("TT2_GPU_DUMP_NTH"); return v ? std::atoi(v) : 1; }();
+                static int dump_bursts = 0;
+                static uint64_t dump_last = ~0ull;
+                if (dump_on && dest == dump_on && (dump_last == ~0ull || g_frame > dump_last + 120))
+                    dump_bursts++;
+                if (dump_on && dest == dump_on)
+                    dump_last = g_frame;
+                static bool dump_armed = true;
+                if (dump_on && dest == dump_on && dump_armed && dump_bursts == dump_nth)
+                {
+                    dump_armed = false;
+                    const char* delay = std::getenv("TT2_GPU_DUMP_DELAY");
+                    g_dump_frame = g_frame + 2 + (delay ? std::strtoull(delay, nullptr, 10) : 0);
+                    log("renderer: resolve to %08X at frame %llu, dumping the next frame", dest, (unsigned long long)g_frame);
+                }
                 if (dumping())
                     log("dump: resolve %s %d,%d-%d,%d src info %08X pitch %u -> %08X (%ux%u) control %08X dest info %08X", depth ? "depth" : "color", x0, y0, x1,
                         y1, depth ? r(RB_DEPTH_INFO) : r(RB_COLOR_INFO_REGS[src_select & 3]), pitch, dest, dw, dh, control, r(RB_COPY_DEST_INFO));
                 static int logged = 0;
-                if (logged++ < 12)
+                static std::set<uint32_t> seen_dests;
+                if (logged++ < 12 || seen_dests.insert(dest).second)
                     log("renderer: resolve %s %d,%d-%d,%d to %08X (%ux%u, format %u)", depth ? "depth" : "color", x0, y0, x1, y1, dest, dw, dh,
                         (r(RB_COPY_DEST_INFO) >> 7) & 0x3F);
                 if (res.surface.tex)
@@ -1097,6 +1291,8 @@ float4 ps_text(BlitOut i) : SV_Target
                             g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
                         }
                     }
+                    if (!depth)
+                        arm_write_back(res, dest, x0, y0, std::min<int32_t>(x1, int32_t(dw)), std::min<int32_t>(y1, int32_t(dh)));
                     if (dumping() && depth)
                     {
                         // Actual depth values of the copy (an 8-bit preview cannot show them).
@@ -1200,7 +1396,13 @@ float4 ps_text(BlitOut i) : SV_Target
                 return;
             }
             if (edram_mode != 4 && edram_mode != 5)
+            {
+                static uint32_t n = 0;
+                if (n++ < 20)
+                    log("renderer: draw with edram mode %u (prim %u count %u, vs memexport %d)", edram_mode, prim, count,
+                        g_current_vs && prepare(*g_current_vs) ? int(g_current_vs->meta.memexport) : -1);
                 return;
+            }
             if (!g_current_vs || !g_current_ps || !prepare(*g_current_vs))
                 return;
             const bool depth_only = edram_mode == 5;
@@ -1222,6 +1424,18 @@ float4 ps_text(BlitOut i) : SV_Target
                     log("dump:   vs const base %u ps base %u | c128 %g %g %g %g | c129 %g %g %g %g | c130 %g %g %g %g | c131 %g %g %g %g | c132 %g %g", vbase, pbase,
                         cf(512), cf(513), cf(514), cf(515), cf(516), cf(517), cf(518), cf(519), cf(520), cf(521), cf(522), cf(523), cf(524), cf(525), cf(526),
                         cf(527), cf(528), cf(529));
+                    {
+                        // Pixel shader constants c0-c15 and c248-c255.
+                        std::string ps;
+                        char buf[96];
+                        for (uint32_t i : { 0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 11u, 12u, 13u, 14u, 15u, 248u, 249u, 250u, 251u, 252u, 253u, 254u, 255u })
+                        {
+                            const uint32_t at = std::min((256u + i) * 4u, 2044u);
+                            snprintf(buf, sizeof(buf), " c%u %g %g %g %g |", i, rf(kAluConsts + at), rf(kAluConsts + at + 1), rf(kAluConsts + at + 2), rf(kAluConsts + at + 3));
+                            ps += buf;
+                        }
+                        log("dump:   ps consts%s", ps.c_str());
+                    }
                     for (uint32_t slot : vm.vertex_slots)
                     {
                         const uint32_t d0 = r(kFetchConsts + slot * 2), d1 = r(kFetchConsts + slot * 2 + 1);
@@ -1395,6 +1609,13 @@ float4 ps_text(BlitOut i) : SV_Target
                         log("dump:   tf%u dim %u base %08X format %u %ux%u tiled %u -> %s%s", t.slot, t.dimension, f1 & 0x1FFFF000, f1 & 0x3F,
                             (f2 & 0x1FFF) + 1, ((f2 >> 13) & 0x1FFF) + 1, f0 >> 31, b.srv ? "bound" : "MISSING",
                             g_resolved.count(f1 & 0x1FFFF000) ? " (resolved)" : "");
+                        // How much of the texture's first page is non-zero (CPU-generated textures).
+                        const uint8_t* raw = phys_ptr(f1 & 0x1FFFF000);
+                        uint32_t nonzero = 0;
+                        for (uint32_t i = 0; i < 4096; i++)
+                            nonzero += raw[i] != 0;
+                        log("dump:     raw %02X%02X%02X%02X %02X%02X%02X%02X, %u of 4096 bytes non-zero", raw[0], raw[1], raw[2], raw[3], raw[4], raw[5],
+                            raw[6], raw[7], nonzero);
                     }
                     srvs[t.slot] = b.srv;
                     smps[t.slot] = sampler(t.slot);
@@ -1483,6 +1704,7 @@ float4 ps_text(BlitOut i) : SV_Target
                         return;
                     ComPtr<ID3D11Resource> res;
                     rtv->GetResource(&res);
+                    pick(res.Get());
                     ComPtr<ID3D11ShaderResourceView> srv;
                     g_device->CreateShaderResourceView(res.Get(), nullptr, &srv);
                     g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
@@ -1716,8 +1938,10 @@ float4 ps_text(BlitOut i) : SV_Target
             g_ctx->Unmap(staging.Get(), 0);
             std::error_code ec;
             fs::create_directories(g_screenshot_dir, ec);
-            char name[64];
-            snprintf(name, sizeof(name), "frame_%06llu.png", (unsigned long long)g_frame);
+            // Two instances on one PC (TT2_LOG_NAME set): prefix the file with the log name.
+            const char* prefix = std::getenv("TT2_LOG_NAME");
+            char name[160];
+            snprintf(name, sizeof(name), "%s%sframe_%06llu.png", prefix ? prefix : "", prefix ? "_" : "", (unsigned long long)g_frame);
             write_png(g_screenshot_dir / name, rgba.data(), d.Width, d.Height, d.Width * 4);
         }
     }
@@ -1774,6 +1998,10 @@ float4 ps_text(BlitOut i) : SV_Target
             return false;
         }
         factory->MakeWindowAssociation(g_hwnd, DXGI_MWA_NO_ALT_ENTER);
+        // Queue at most one frame ahead of the GPU (the default is three, ~50 ms of input lag).
+        ComPtr<IDXGIDevice1> dxgi_device1;
+        if (SUCCEEDED(g_device.As(&dxgi_device1)))
+            dxgi_device1->SetMaximumFrameLatency(1);
 
         std::string error;
         auto gs = [&](const char* entry, ComPtr<ID3D11GeometryShader>& out) {
@@ -1823,9 +2051,15 @@ float4 ps_text(BlitOut i) : SV_Target
             g_screenshot_interval = uint32_t(std::atoi(v));
         if (const char* v = std::getenv("TT2_GPU_DUMP_FRAME"); v && std::atoll(v) > 0)
             g_dump_frame = uint64_t(std::atoll(v));
+        if (const char* v = std::getenv("TT2_GPU_PICK"); v && std::strchr(v, ','))
+        {
+            g_pick_x = std::atoi(v);
+            g_pick_y = std::atoi(std::strchr(v, ',') + 1);
+        }
         g_dump_dir = screenshot_dir.parent_path() / "gpu" / "dump";
         g_shader_cache = screenshot_dir.parent_path() / "cache" / "shaders";
         start_workers();
+        AddVectoredExceptionHandler(1, write_back_fault);
         g_active = true;
         log("renderer: Direct3D 11 on %s", name);
         return true;
@@ -1852,6 +2086,7 @@ float4 ps_text(BlitOut i) : SV_Target
 
     void draw(uint32_t initiator, uint32_t index_base, uint32_t index_size)
     {
+        std::lock_guard lock(g_lock);
         if (g_active)
             do_draw(initiator, index_base, index_size);
     }
@@ -1910,6 +2145,7 @@ float4 ps_text(BlitOut i) : SV_Target
 
     void swap(uint32_t frontbuffer_physical, uint32_t width, uint32_t height)
     {
+        std::lock_guard lock(g_lock);
         if (!g_active)
             return;
         g_frame++;

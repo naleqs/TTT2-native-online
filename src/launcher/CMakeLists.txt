@@ -4,10 +4,11 @@ tt2_fetch_json()
 
 add_executable(tt2-launcher WIN32
     main.cpp
+    avatar.cpp
     config.cpp
     osk.cpp
     process.cpp)
-target_link_libraries(tt2-launcher PRIVATE tt2_imgui tt2_netplay nlohmann_json::nlohmann_json)
+target_link_libraries(tt2-launcher PRIVATE tt2_imgui tt2_netplay nlohmann_json::nlohmann_json windowscodecs ole32 comdlg32)
 if(TARGET tt2_lobby)
     target_link_libraries(tt2-launcher PRIVATE tt2_lobby)
 endif()

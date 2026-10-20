@@ -31,6 +31,8 @@ namespace tt2
     uint32_t timestamp_bundle();             // image.cpp
     uint64_t timebase_now();                 // timebase.cpp
     void timebase_frame(uint64_t frame_base);
+    void timebase_set_deterministic();
+    uint64_t timebase_deterministic_start();
 }
 
 namespace tt2::rollback
@@ -239,8 +241,11 @@ namespace tt2::rollback
         }
 
         // One frame without presenting or new sounds, with the given inputs.
+        uint64_t g_frame_serial = 0;
+
         void resimulate(int frame, const FrameInput& in)
         {
+            g_frame_serial++;
             g_current = in;
             lock_time(frame);
             g_resim = true;
@@ -340,6 +345,7 @@ namespace tt2::rollback
                 g_current.pads[p] = input::read(p);
             g_inputs[k % kRing] = g_current;
             lock_time(k);
+            g_frame_serial++;
 
             if (k > 0 && k % 600 == 0)
             {
@@ -359,7 +365,11 @@ namespace tt2::rollback
             netplay::SessionConfig cfg;
             cfg.local_player = g_net.local_player;
             cfg.input_delay = g_net.input_delay;
-            cfg.max_prediction = g_net.max_prediction;
+            // Lockstep outside fights: a rollback re-runs only the game's update calls, and the
+            // menus react to input outside them, so predicting there would lose inputs on the side
+            // that rolls back. TT2_NET_PREDICTION overrides it (testing).
+            const char* pred = std::getenv("TT2_NET_PREDICTION");
+            cfg.max_prediction = pred ? std::atoi(pred) : 0;
             cfg.build_id = g_net.build_id;
             cfg.checksum_interval = 0; // the per-frame delta hash also sees other threads' writes
 
@@ -387,7 +397,7 @@ namespace tt2::rollback
             cb.on_event = [](const netplay::Event& e) {
                 switch (e.type)
                 {
-                case netplay::EventType::Running: log("netplay: connected, input delay %d frame(s), rollback up to %d frames", e.progress, g_net.max_prediction); break;
+                case netplay::EventType::Running: log("netplay: connected, input delay %d frame(s)", e.progress); break;
                 case netplay::EventType::Disconnected: log("netplay: disconnected (%s)", e.reason.c_str()); break;
                 case netplay::EventType::ConnectionInterrupted: log("netplay: connection interrupted"); break;
                 case netplay::EventType::ConnectionResumed: log("netplay: connection resumed"); break;
@@ -402,6 +412,10 @@ namespace tt2::rollback
         {
             if (!g_session)
                 start_session();
+
+            // Work the other threads started during the frame (loading, decompression) finishes
+            // before the next frame on both PCs, so loads complete on the same frame everywhere.
+            kernel::wait_for_other_threads(100);
 
             // The previous live frame ran: the session saves the state of this frame.
             if (g_frame_open)
@@ -419,8 +433,12 @@ namespace tt2::rollback
                 {
                     for (int p = 0; p < 2; p++)
                         g_current.pads[p] = input::from_netplay(in[p]);
+                    static int logged = 0;
+                    if ((in[0] || in[1]) && logged++ < 40)
+                        log("netplay: frame %d inputs %04X %04X", g_session->frame(), unsigned(in[0]), unsigned(in[1]));
                     g_frame = g_session->frame();
                     lock_time(g_frame);
+                    g_frame_serial++;
                     g_frame_open = true;
                     break;
                 }
@@ -435,6 +453,47 @@ namespace tt2::rollback
                 std::this_thread::sleep_for(std::chrono::microseconds(500)); // waiting for the peer
             }
 
+            // TT2_NET_DUMP=frame[,frame...]: write the game's writable image data and virtual-memory
+            // heaps at those frames to native\logs (diff two players' dumps to find a desync).
+            static const std::vector<int> dump_frames = [] {
+                std::vector<int> v;
+                if (const char* s = std::getenv("TT2_NET_DUMP"))
+                    for (const char* p = s; *p;)
+                    {
+                        v.push_back(std::atoi(p));
+                        while (*p && *p != ',')
+                            p++;
+                        if (*p)
+                            p++;
+                    }
+                return v;
+            }();
+            if (std::find(dump_frames.begin(), dump_frames.end(), g_session->frame()) != dump_frames.end())
+            {
+                const char* name = std::getenv("TT2_LOG_NAME");
+                char file[96];
+                snprintf(file, sizeof(file), "%s_mem_%06d.bin", name ? name : "tt2", g_session->frame());
+                if (FILE* f = fopen((std::string("..\\logs\\") + file).c_str(), "wb"))
+                {
+                    std::vector<std::pair<uint32_t, uint32_t>> spans = { { image_data_start(), g_image.base + g_image.size - image_data_start() } };
+                    for (auto [s, n] : g_memory.virt.ranges())
+                        spans.push_back({ s, n });
+                    for (auto [s, n] : spans)
+                    {
+                        fwrite(&s, 4, 1, f);
+                        fwrite(&n, 4, 1, f);
+                        fwrite(g_base + s, 1, n, f);
+                    }
+                    fclose(f);
+                    log("netplay: memory dump at frame %d written to logs\\%s", g_session->frame(), file);
+                }
+            }
+            if (g_session->frame() % 600 == 0)
+            {
+                const auto s = g_session->stats();
+                log("netplay: frame %d, ping %d ms, delay %d, %llu frames waited, %llu rollbacks", g_session->frame(), s.rtt_ms, s.input_delay,
+                    (unsigned long long)s.frames_waited, (unsigned long long)s.rollbacks);
+            }
             if (g_session->frame() % 60 == 0)
             {
                 const auto s = g_session->stats();
@@ -495,6 +554,9 @@ namespace tt2::rollback
         }
         g_mode = Mode::Netplay;
         g_intercept = true;
+        // Both games must read the same clocks from the very start (boot code seeds from them).
+        timebase_set_deterministic();
+        g_time0 = timebase_deterministic_start();
         log("netplay: player %d, local port %u, peer %s:%u (rollback starts at the first frame boundary)", o.local_player + 1, o.local_port,
             o.remote_host.c_str(), o.remote_port);
     }
@@ -511,6 +573,13 @@ namespace tt2::rollback
     }
 
     bool netplay_active() { return g_mode == Mode::Netplay; }
+
+    int current_frame(uint64_t* serial)
+    {
+        if (serial)
+            *serial = g_frame_serial;
+        return g_intercept ? g_frame : -1;
+    }
 
     std::string status_line()
     {

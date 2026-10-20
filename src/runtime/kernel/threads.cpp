@@ -155,6 +155,7 @@ namespace tt2::kernel
         auto t = std::make_shared<Thread>();
         setup_guest_identity(*t, 64 * 1024);
         t->name = name;
+        t->adopted = true;
         register_body(t, 0);
         register_thread(t);
         t_thread = t;
@@ -170,6 +171,67 @@ namespace tt2::kernel
     }
 
     std::shared_ptr<Thread> current_thread() { return t_thread; }
+
+    BlockedScope::BlockedScope() : thread(t_thread.get())
+    {
+        if (thread)
+            thread->blocked.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    BlockedScope::~BlockedScope()
+    {
+        if (thread)
+            thread->blocked.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+    int64_t now_ms()
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    void note_file_activity()
+    {
+        if (Thread* t = t_thread.get())
+            t->last_io_ms.store(now_ms(), std::memory_order_relaxed);
+    }
+
+    void wait_for_other_threads(int timeout_ms)
+    {
+        Thread* self = t_thread.get();
+        const auto start = std::chrono::steady_clock::now();
+        const auto deadline = start + std::chrono::milliseconds(timeout_ms);
+        int quiet = 0;
+        for (;;)
+        {
+            std::vector<Thread*> running;
+            for_each_thread([&](Thread& t) {
+                if (&t == self || t.adopted || !t.started || t.exited || t.suspend_count > 0 || t.busy_frames >= 30)
+                    return;
+                // Only loaders: threads that used the file system in the last 3 seconds. Waiting
+                // for every worker (physics, audio) would cost a lot of time every frame.
+                if (now_ms() - t.last_io_ms.load(std::memory_order_relaxed) > 3000)
+                    return;
+                if (t.blocked.load(std::memory_order_acquire) == 0)
+                    running.push_back(&t);
+            });
+            if (running.empty())
+            {
+                // Two quiet looks in a row: a thread woken in between has had time to show up.
+                if (++quiet >= 2)
+                    return;
+            }
+            else
+                quiet = 0;
+            if (std::chrono::steady_clock::now() >= deadline)
+            {
+                for (Thread* t : running)
+                    if (++t->busy_frames == 30)
+                        tt2::log("netplay: thread %u (%s) never goes idle; no longer waited for", t->id, t->name.c_str());
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+    }
 
     void for_each_thread(const std::function<void(Thread&)>& fn)
     {
@@ -326,7 +388,10 @@ TT2_IMPORT(KeDelayExecutionThread)
     if (!deadline || *deadline <= Clock::now())
         std::this_thread::yield();
     else
+    {
+        BlockedScope blocked;
         std::this_thread::sleep_until(*deadline);
+    }
     a.ret(status::success);
 }
 

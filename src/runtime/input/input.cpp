@@ -1,4 +1,5 @@
 #include "input.h"
+#include "../netplay_glue.h"
 
 #include <SDL3/SDL.h>
 
@@ -61,7 +62,11 @@ namespace tt2::input
 
         void scripted(PadState& s)
         {
-            const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_start).count();
+            // In netplay the script follows the game's frames (60 per second), so both players'
+            // presses land on the same frames however fast each PC runs.
+            int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_start).count();
+            if (const int frame = netglue::frame(nullptr); frame >= 0)
+                now = int64_t(frame) * 1000 / 60;
             for (const ScriptedPress& p : g_script)
                 if (now >= p.at_ms && now < p.at_ms + 150)
                     s.buttons |= p.bit;

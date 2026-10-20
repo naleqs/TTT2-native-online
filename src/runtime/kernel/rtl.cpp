@@ -446,10 +446,16 @@ TT2_IMPORT(RtlCompareStringN)
 
 // ---------------------------------------------------------------------- time
 
+namespace tt2
+{
+    bool timebase_deterministic();
+    uint64_t timebase_deterministic_filetime();
+}
+
 TT2_IMPORT(KeQuerySystemTime)
 {
     if (ctx.r3.u32)
-        store64(ctx.r3.u32, uint64_t(now_filetime()));
+        store64(ctx.r3.u32, timebase_deterministic() ? timebase_deterministic_filetime() : uint64_t(now_filetime()));
 }
 
 TT2_IMPORT(KeQueryPerformanceFrequency)

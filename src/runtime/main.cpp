@@ -20,6 +20,8 @@
 #include "kernel/io.h"
 #include "kernel/threads.h"
 
+#include <atomic>
+#include <thread>
 #include <SDL3/SDL.h>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -45,6 +47,8 @@ namespace tt2
     namespace xam
     {
         extern fs::path g_save_root;
+        extern fs::path g_dlc_root;
+        extern std::string g_names[2];
     }
 
     bool g_trace_imports = false;
@@ -161,6 +165,62 @@ namespace
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
+    // TT2_WATCH=<guest address, hex>: log the functions that write that page (debugging).
+    // The page is made read-only; a write is logged, the page opened for that one instruction
+    // and protected again by a single-step trap, so every later writer is caught too.
+    uint32_t g_watch = 0, g_watch_exact = 0;
+
+    thread_local bool t_watch_step = false;
+
+    LONG CALLBACK watch_handler(EXCEPTION_POINTERS* info)
+    {
+        // The single step after a logged write: protect the page again at once.
+        if (info->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP && t_watch_step)
+        {
+            t_watch_step = false;
+            DWORD old;
+            VirtualProtect(g_base + g_watch, 0x1000, PAGE_READONLY, &old);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || info->ExceptionRecord->NumberParameters < 2 ||
+            info->ExceptionRecord->ExceptionInformation[0] != 1)
+            return EXCEPTION_CONTINUE_SEARCH;
+        const uintptr_t addr = info->ExceptionRecord->ExceptionInformation[1];
+        if (addr < uintptr_t(g_base) + g_watch || addr >= uintptr_t(g_base) + g_watch + 0x1000)
+            return EXCEPTION_CONTINUE_SEARCH;
+        PPCContext* ctx = current_context();
+        static std::atomic<int> logged{ 0 };
+        // A watch address that is not page aligned: only writes to its 16 bytes are logged.
+        const uint32_t guest = uint32_t(addr - uintptr_t(g_base));
+        const bool wanted = !(g_watch_exact & 0xFFF) || (guest & ~0xFu) == (g_watch_exact & ~0xFu);
+        if (wanted && logged++ < 64)
+            log("watch: write to %08llX in sub_%08X, lr %08llX, stack:%s", (unsigned long long)(addr - uintptr_t(g_base)),
+                kernel::guest_function_at(uintptr_t(info->ExceptionRecord->ExceptionAddress)), (unsigned long long)(ctx ? ctx->lr : 0),
+                ctx ? guest_backtrace(ctx->r1.u32, 8).c_str() : "");
+        if (wanted && ctx && logged <= 64)
+            log("watch:   r3 %08X r4 %08X r5 %08X r6 %08X r7 %08X r8 %08X r9 %08X r10 %08X r11 %08X r31 %08X", ctx->r3.u32, ctx->r4.u32, ctx->r5.u32,
+                ctx->r6.u32, ctx->r7.u32, ctx->r8.u32, ctx->r9.u32, ctx->r10.u32, ctx->r11.u32, ctx->r31.u32);
+        DWORD old;
+        VirtualProtect(g_base + g_watch, 0x1000, PAGE_READWRITE, &old);
+        // Let the write happen, then trap right after it (trap flag) to protect the page again.
+        info->ContextRecord->EFlags |= 0x100;
+        t_watch_step = true;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    void start_watch()
+    {
+        const char* v = std::getenv("TT2_WATCH");
+        if (!v || !*v)
+            return;
+        g_watch_exact = uint32_t(std::strtoul(v, nullptr, 16));
+        g_watch = g_watch_exact & ~0xFFFu;
+        AddVectoredExceptionHandler(1, watch_handler);
+        DWORD old;
+        VirtualProtect(g_base + g_watch, 0x1000, PAGE_READONLY, &old);
+        log("watch: page %08X", g_watch);
+    }
+
     struct CommandLine
     {
         bool fullscreen = false;
@@ -194,6 +254,10 @@ namespace
                 c.net.input_delay = std::stoi(next());
             else if (a == "--build-id")
                 c.net.build_id = std::stoull(next(), nullptr, 16);
+            else if (a == "--name1")
+                xam::g_names[0] = next();
+            else if (a == "--name2")
+                xam::g_names[1] = next();
         }
         return c;
     }
@@ -289,10 +353,15 @@ int main(int argc, char** argv)
     io::mount("\\device\\cdrom0", native / "game", true);
     io::link("game:", "\\device\\cdrom0");
     io::link("d:", "\\device\\cdrom0");
-    fs::create_directories(native / "hdd", ec);
-    fs::create_directories(native / "cache", ec);
-    io::mount("\\device\\harddisk0\\partition1", native / "hdd", false);
-    io::mount("\\device\\harddisk0\\cache0", native / "cache", false);
+    // TT2_INSTANCE=name: a second game on the same PC (netplay tests) keeps its own hard disk,
+    // cache and saves in native\instances\<name>, so the two don't fight over the same files.
+    fs::path user_data = native;
+    if (const char* inst = std::getenv("TT2_INSTANCE"); inst && *inst)
+        user_data = native / "instances" / inst;
+    fs::create_directories(user_data / "hdd", ec);
+    fs::create_directories(user_data / "cache", ec);
+    io::mount("\\device\\harddisk0\\partition1", user_data / "hdd", false);
+    io::mount("\\device\\harddisk0\\cache0", user_data / "cache", false);
     io::link("hdd:", "\\device\\harddisk0\\partition1");
     io::link("cache:", "\\device\\harddisk0\\cache0");
 #if TT2_TU3
@@ -313,7 +382,8 @@ int main(int argc, char** argv)
             log("title update folder '%s' is missing: run Setup.bat again", folder.c_str());
     }
 #endif
-    xam::g_save_root = native / "save";
+    xam::g_save_root = user_data / "save";
+    xam::g_dlc_root = native / "dlc";
     fs::create_directories(xam::g_save_root, ec);
 
     gpu::set_shader_dump_dir(native / "gpu" / "shaders");
@@ -327,6 +397,7 @@ int main(int argc, char** argv)
         rollback::configure_stress(v[0], v[1], v[2]);
     }
 
+    start_watch();
     log("starting the game at %08X", g_image.entry);
     auto main_thread = kernel::start_thread(g_image.entry, 0, 0, g_image.stack_size, false, "main");
 

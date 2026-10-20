@@ -64,8 +64,36 @@ frame: about 0.07 ms per save and 0.2 ms per load in the game.
   clock.
 - **Locks:** kernel lock state lives outside game memory, so a rollback never resurrects a held
   lock.
-- **Missing:** a sync point at fight start (both players must roll back from the same state),
-  and in-game desync detection. See `docs/STATUS.md`.
+- **Lockstep outside fights.** A rollback re-runs only the game's update calls, and the menus
+  react to input outside them, so the side that rolls back would lose menu inputs. The session
+  therefore runs with no prediction (`max_prediction` 0): a frame runs once both inputs are
+  confirmed and nothing is ever rolled back. `Session::set_max_prediction` switches prediction on;
+  that is meant for fights once fight start is detected. `TT2_NET_PREDICTION=n` forces it (tests).
+- **Same game on both PCs.** Everything the game reads must be identical on both sides:
+  - keystrokes (`XamInputGetKeystrokeEx`) come from each frame's shared pad state, with key
+    repeat counted in frames, and are rebuilt when a frame runs again
+  - every clock (timebase, system time, the kernel's time stamp bundle, all threads) follows
+    the frame-locked time from a fixed start, so boot-time seeds match
+  - both players are signed in and ports 3-4 are empty, whatever controllers each PC has
+  - **loader barrier:** at each frame boundary the main thread waits (up to 100 ms) until
+    every thread that used the file system in the last 3 seconds is blocked, so a load finishes
+    on the same frame on both PCs
+- **Tested** with two games on one PC (`TT2_INSTANCE=A`/`B`, frame-timed `TT2_INPUT_SCRIPT`):
+  boot, menus, VS character and stage select stay identical frame for frame.
+- **Missing:** random choices (random stage, intro animations) still differ: some state the
+  game's random numbers depend on is reached a frame apart on the two PCs. Fight start
+  detection (for rollback in fights) and in-game desync detection are also still to do. See
+  `docs/STATUS.md`.
+
+## Profiles
+
+- Name and profile picture are set in the launcher's Settings. The picture is any image file,
+  cropped to a square and stored as a 96x96 PNG in `native\profile\avatar.png`.
+- The lobby sends both in the `hello` message (the picture as base64, at most 64 KB) and shows
+  every player's picture next to their name.
+- The game shows the names as the players' gamertags: the launcher starts it with
+  `--name1 <player 1> --name2 <player 2>`, the same on both PCs. Direct connect does not know the
+  other player's name and uses "Player N" for them.
 
 ## Lobby (`src/netplay/src/lobby.cpp`)
 

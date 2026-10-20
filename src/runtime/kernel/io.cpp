@@ -6,6 +6,7 @@
 
 #include "objects.h"
 #include "io.h"
+#include "threads.h"
 #include "../memory.h"
 #include "../rollback/game_rollback.h"
 
@@ -339,12 +340,14 @@ namespace
 TT2_IMPORT(NtCreateFile)
 {
     Args a{ ctx };
+    note_file_activity();
     a.ret(open_file(a, a.u32(2), a.u32(3), a.u32(7), a.u32(8), a.u32(1)));
 }
 
 TT2_IMPORT(NtOpenFile)
 {
     Args a{ ctx };
+    note_file_activity();
     a.ret(open_file(a, a.u32(2), a.u32(3), XFILE_OPEN, a.u32(5), a.u32(1)));
 }
 
@@ -352,6 +355,7 @@ TT2_IMPORT(NtOpenFile)
 TT2_IMPORT(NtReadFile)
 {
     Args a{ ctx };
+    note_file_activity();
     a.ret(transfer(a, false, a.u32(5), a.u32(6), a.ptr<be<int64_t>>(7)));
 }
 

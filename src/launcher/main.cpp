@@ -2,6 +2,7 @@
 // Fully usable with a controller (D-pad/stick to move, A to select, B to go back); text is
 // entered with an on-screen keyboard.
 
+#include "avatar.h"
 #include "config.h"
 #include "osk.h"
 #include "process.h"
@@ -12,12 +13,17 @@
 #endif
 
 #include <SDL3/SDL.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_sdlrenderer3.h>
 
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -47,6 +53,11 @@ namespace
         std::unique_ptr<ChildProcess> child;   // setup or game
         std::string message;
         Osk osk;
+        SDL_Window* window = nullptr;
+        SDL_Renderer* renderer = nullptr;
+        SDL_Texture* avatar = nullptr;          // our profile picture (null: none)
+        // Other players' pictures, by peer id (with the PNG they were made from).
+        std::map<std::string, std::pair<std::string, SDL_Texture*>> peer_avatars;
 #ifdef TT2_WITH_LOBBY
         std::unique_ptr<tt2::lobby::Lobby> lobby;
         std::unique_ptr<tt2::lobby::LoopbackRelay> relay;
@@ -54,6 +65,44 @@ namespace
         std::string lobby_log;
 #endif
     };
+
+    fs::path avatar_file(const App& app) { return app.native / "profile" / "avatar.png"; }
+
+    SDL_Texture* make_texture(SDL_Renderer* renderer, const Rgba& image)
+    {
+        if (image.pixels.empty())
+            return nullptr;
+        SDL_Texture* t = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, image.width, image.height);
+        if (t)
+        {
+            SDL_UpdateTexture(t, nullptr, image.pixels.data(), image.width * 4);
+            SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+        }
+        return t;
+    }
+
+    void reload_avatar(App& app)
+    {
+        if (app.avatar)
+            SDL_DestroyTexture(app.avatar);
+        app.avatar = nullptr;
+        Rgba image;
+        if (fs::exists(avatar_file(app)) && decode_image_file(avatar_file(app), image))
+            app.avatar = make_texture(app.renderer, image);
+    }
+
+    // A square picture, or an empty frame of the same size when there is none.
+    void avatar_image(SDL_Texture* t, float size)
+    {
+        if (t)
+            ImGui::Image(ImTextureID(t), ImVec2(size, size));
+        else
+        {
+            const ImVec2 p = ImGui::GetCursorScreenPos();
+            ImGui::GetWindowDrawList()->AddRect(p, ImVec2(p.x + size, p.y + size), IM_COL32(90, 90, 110, 255), 6.0f);
+            ImGui::Dummy(ImVec2(size, size));
+        }
+    }
 
     void refresh_build(App& app)
     {
@@ -70,6 +119,22 @@ namespace
         if (!enabled)
             ImGui::EndDisabled();
         return pressed && enabled;
+    }
+
+    std::wstring widen_utf8(const std::string& s)
+    {
+        if (s.empty())
+            return {};
+        const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), nullptr, 0);
+        std::wstring w(size_t(n), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), w.data(), n);
+        return w;
+    }
+
+    // The two players' names as the game shows them (its gamertags), the same on both PCs.
+    std::vector<std::wstring> name_args(const std::string& p1, const std::string& p2)
+    {
+        return { L"--name1", widen_utf8(p1), L"--name2", widen_utf8(p2) };
     }
 
     void start_game(App& app, const std::vector<std::wstring>& extra)
@@ -106,7 +171,7 @@ namespace
             ImGui::Text("Game: %s   build %s", app.build->version.c_str(), app.build->build_id.c_str());
             ImGui::Spacing();
             if (big_button("Local versus (2 controllers)"))
-                start_game(app, {});
+                start_game(app, name_args(app.config.name, "Player 2"));
 #ifdef TT2_WITH_LOBBY
             if (big_button("Online lobby"))
                 app.screen = Screen::Lobby;
@@ -180,9 +245,13 @@ namespace
             std::string port = std::to_string(app.config.local_port);
             if (host.find(':') == std::string::npos)
                 host += ":" + port;
-            start_game(app, { L"--netplay", L"--player", std::to_wstring(app.config.direct_side + 1), L"--local-port", widen(port),
-                              L"--peer", widen(host), L"--build-id", widen(app.build->build_id),
-                              L"--delay", std::to_wstring(app.config.input_delay) });
+            std::vector<std::wstring> args = { L"--netplay", L"--player", std::to_wstring(app.config.direct_side + 1), L"--local-port", widen(port),
+                                               L"--peer", widen(host), L"--build-id", widen(app.build->build_id),
+                                               L"--delay", std::to_wstring(app.config.input_delay) };
+            // The other player's name is not known here: both PCs use "Player N" for it.
+            const auto names = app.config.direct_side == 0 ? name_args(app.config.name, "Player 2") : name_args("Player 1", app.config.name);
+            args.insert(args.end(), names.begin(), names.end());
+            start_game(app, args);
         }
         if (big_button("Back"))
             app.screen = Screen::Home;
@@ -197,6 +266,7 @@ namespace
             LobbyConfig cfg;
             cfg.build_id = app.build->build_id;
             cfg.display_name = app.config.name;
+            cfg.avatar_png = read_file_bytes(avatar_file(app));
             cfg.room = app.config.room;
             cfg.trackers = app.config.trackers;
             cfg.ice_servers = app.config.ice_servers;
@@ -231,9 +301,16 @@ namespace
                     break;
                 }
                 app.lobby->set_status(PeerStatus::InMatch);
-                start_game(app, { L"--netplay", L"--player", std::to_wstring(e.local_player + 1), L"--local-port", std::to_wstring(game_port),
-                                  L"--peer", L"127.0.0.1:" + std::to_wstring(relay_port), L"--build-id", widen(app.build->build_id),
-                                  L"--delay", std::to_wstring(app.config.input_delay) });
+                std::string other = "Opponent";
+                for (const auto& p : app.lobby->peers())
+                    if (p.id == e.peer_id)
+                        other = p.name;
+                std::vector<std::wstring> args = { L"--netplay", L"--player", std::to_wstring(e.local_player + 1), L"--local-port", std::to_wstring(game_port),
+                                                   L"--peer", L"127.0.0.1:" + std::to_wstring(relay_port), L"--build-id", widen(app.build->build_id),
+                                                   L"--delay", std::to_wstring(app.config.input_delay) };
+                const auto names = e.local_player == 0 ? name_args(app.config.name, other) : name_args(other, app.config.name);
+                args.insert(args.end(), names.begin(), names.end());
+                start_game(app, args);
                 break;
             }
             default:
@@ -241,6 +318,8 @@ namespace
             }
         }
 
+        avatar_image(app.avatar, 48);
+        ImGui::SameLine();
         ImGui::Text("Online lobby  -  room '%s'  -  you are %s", app.config.room.c_str(), app.config.name.c_str());
         ImGui::TextDisabled("%s", app.lobby_log.c_str());
         ImGui::Spacing();
@@ -271,6 +350,19 @@ namespace
                                "WebTorrent trackers and connect to you directly (no lobby server).");
         for (const auto& p : peers)
         {
+            // Their picture, made into a texture when it arrives or changes.
+            auto& cached = app.peer_avatars[p.id];
+            if (cached.first != p.avatar_png)
+            {
+                if (cached.second)
+                    SDL_DestroyTexture(cached.second);
+                cached = { p.avatar_png, nullptr };
+                Rgba image;
+                if (!p.avatar_png.empty() && decode_image_bytes(p.avatar_png, image))
+                    cached.second = make_texture(app.renderer, image);
+            }
+            avatar_image(cached.second, 56);
+            ImGui::SameLine();
             const char* status = p.status == PeerStatus::InMatch ? "in a match" : p.status == PeerStatus::Away ? "away" : "ready";
             char label[160];
             snprintf(label, sizeof(label), "%-24s  %4d ms   %s##%s", p.name.c_str(), p.ping_ms, status, p.id.c_str());
@@ -293,7 +385,33 @@ namespace
     {
         ImGui::TextUnformatted("Settings");
         ImGui::Spacing();
+        avatar_image(app.avatar, 96);
+        ImGui::SameLine();
+        ImGui::BeginGroup();
         ImGui::Text("Name: %s", app.config.name.c_str());
+        ImGui::TextDisabled("Your name and picture are shown to other players in the lobby.");
+        ImGui::EndGroup();
+        if (big_button("Choose profile picture..."))
+        {
+            const fs::path chosen = pick_image_file(SDL_GetPointerProperty(SDL_GetWindowProperties(app.window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+            if (!chosen.empty())
+            {
+                std::string error;
+                if (import_avatar(chosen, avatar_file(app), &error))
+                {
+                    reload_avatar(app);
+                    app.message = "Profile picture saved.";
+                }
+                else
+                    app.message = error;
+            }
+        }
+        if (app.avatar && big_button("Remove profile picture"))
+        {
+            std::error_code ec;
+            fs::remove(avatar_file(app), ec);
+            reload_avatar(app);
+        }
         if (big_button("Change name"))
             app.osk.open("Your name", app.config.name, Osk::Layout::Text, [&app](const std::string& v) {
                 if (!v.empty())
@@ -367,6 +485,9 @@ int main(int, char**)
     SDL_Window* window = SDL_CreateWindow("TTT2 Native Online", 960, 640, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     SDL_Renderer* renderer = SDL_CreateRenderer(window, nullptr);
     SDL_SetRenderVSync(renderer, 1);
+    app.window = window;
+    app.renderer = renderer;
+    reload_avatar(app);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -451,6 +572,11 @@ int main(int, char**)
     app.lobby.reset();
 #endif
     save_config(app.native / "launcher.json", app.config);
+    if (app.avatar)
+        SDL_DestroyTexture(app.avatar);
+    for (auto& [id, cached] : app.peer_avatars)
+        if (cached.second)
+            SDL_DestroyTexture(cached.second);
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();

@@ -25,6 +25,10 @@ namespace tt2::kernel
         PPCContext* context = nullptr; // live registers (read racily by the thread dump)
         const char* const* current_import = nullptr; // this thread's t_current_import
         std::string name;
+        bool adopted = false;            // a runtime host thread running guest callbacks
+        std::atomic<int> blocked{ 0 };   // inside a kernel wait or sleep (netplay barrier)
+        int busy_frames = 0;             // netplay barrier: frames it kept the barrier waiting
+        std::atomic<int64_t> last_io_ms{ -1000000 }; // last file call (steady clock, ms): a loader
 
         ObjectType type() const override { return ObjectType::Thread; }
         bool is_signaled(uint32_t) const override { return exited; }
@@ -46,6 +50,23 @@ namespace tt2::kernel
     // Guest function whose recompiled code contains the host address (0: not game code).
     uint32_t guest_function_at(uintptr_t rip);
     void for_each_thread(const std::function<void(Thread&)>& fn);
+
+    // Marks the calling guest thread as blocked for the lifetime of the object (kernel waits,
+    // sleeps, lock contention). The netplay barrier waits until no other thread is running.
+    struct BlockedScope
+    {
+        BlockedScope();
+        ~BlockedScope();
+        Thread* thread;
+    };
+
+    // Netplay: waits (up to `timeout_ms`) until every other guest thread is blocked, so work
+    // other threads do between two frames (loading) completes before the next frame on every PC.
+    // Threads that never block (spinning) stop being waited for after a few frames.
+    void wait_for_other_threads(int timeout_ms);
+
+    // File calls mark the calling thread as a loader for a few seconds (the barrier's scope).
+    void note_file_activity();
 
     // Thrown by ExTerminateThread and caught at the top of the thread.
     struct ThreadExit
