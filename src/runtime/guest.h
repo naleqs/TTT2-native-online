@@ -142,6 +142,7 @@ namespace tt2
 
     void log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
     std::string guest_backtrace(uint32_t r1, int depth); // main.cpp
+    void watch_now(uint32_t address);                     // main.cpp: TT2_WATCH from code (debugging)
     [[noreturn]] void fatal(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 }
 

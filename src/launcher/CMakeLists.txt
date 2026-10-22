@@ -7,7 +7,8 @@ add_executable(tt2-launcher WIN32
     avatar.cpp
     config.cpp
     osk.cpp
-    process.cpp)
+    process.cpp
+    ${TT2_ICON_RC})
 target_link_libraries(tt2-launcher PRIVATE tt2_imgui tt2_netplay nlohmann_json::nlohmann_json windowscodecs ole32 comdlg32)
 if(TARGET tt2_lobby)
     target_link_libraries(tt2-launcher PRIVATE tt2_lobby)

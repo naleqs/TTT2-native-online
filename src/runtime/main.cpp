@@ -31,6 +31,7 @@
 #endif
 #include <windows.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <cstdarg>
@@ -228,6 +229,10 @@ namespace
             in_guest ? "guest" : "host",
             (unsigned long long)(in_guest ? addr - uintptr_t(g_base) : addr), thread ? thread->id : 0,
             (unsigned long long)(ctx ? ctx->lr : 0), ctx ? ctx->r1.u32 : 0, ctx ? guest_backtrace(ctx->r1.u32, 12).c_str() : "");
+        if (ctx)
+            log("CRASH registers: r3 %08X r4 %08X r5 %08X r6 %08X r7 %08X r8 %08X r9 %08X r10 %08X r11 %08X r12 %08X r26 %08X r27 %08X r28 %08X r29 %08X r30 %08X r31 %08X",
+                ctx->r3.u32, ctx->r4.u32, ctx->r5.u32, ctx->r6.u32, ctx->r7.u32, ctx->r8.u32, ctx->r9.u32, ctx->r10.u32, ctx->r11.u32, ctx->r12.u32,
+                ctx->r26.u32, ctx->r27.u32, ctx->r28.u32, ctx->r29.u32, ctx->r30.u32, ctx->r31.u32);
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
@@ -256,6 +261,8 @@ namespace
             return EXCEPTION_CONTINUE_SEARCH;
         PPCContext* ctx = current_context();
         static std::atomic<int> logged{ 0 };
+        // TT2_WATCH_MAX=n: log up to n writes (default 64).
+        static const int max_logged = [] { const char* v = std::getenv("TT2_WATCH_MAX"); return v ? std::atoi(v) : 64; }();
         // A watch address that is not page aligned: only writes to its 16 bytes are logged.
         const uint32_t guest = uint32_t(addr - uintptr_t(g_base));
         bool wanted = !(g_watch_exact & 0xFFF) || (guest & ~0xFu) == (g_watch_exact & ~0xFu);
@@ -269,15 +276,15 @@ namespace
             if (me && guest >= me->stack_base && guest < me->stack_base + me->stack_size)
                 own = true;
             wanted = wanted && !own;
-            if (wanted && logged < 64)
+            if (wanted && logged < max_logged)
                 log("watch:   foreign writer: thread %u '%s' (stack %08X-%08X)", me ? me->id : 0, me ? me->name.c_str() : "host",
                     me ? me->stack_base : 0, me ? me->stack_base + me->stack_size : 0);
         }
-        if (wanted && logged++ < 64)
+        if (wanted && logged++ < max_logged)
             log("watch: write to %08llX in sub_%08X, lr %08llX, stack:%s", (unsigned long long)(addr - uintptr_t(g_base)),
                 kernel::guest_function_at(uintptr_t(info->ExceptionRecord->ExceptionAddress)), (unsigned long long)(ctx ? ctx->lr : 0),
-                ctx ? guest_backtrace(ctx->r1.u32, 8).c_str() : "");
-        if (wanted && ctx && logged <= 64)
+                ctx ? guest_backtrace(ctx->r1.u32, 16).c_str() : "");
+        if (wanted && ctx && logged <= max_logged)
             log("watch:   r3 %08X r4 %08X r5 %08X r6 %08X r7 %08X r8 %08X r9 %08X r10 %08X r11 %08X r31 %08X", ctx->r3.u32, ctx->r4.u32, ctx->r5.u32,
                 ctx->r6.u32, ctx->r7.u32, ctx->r8.u32, ctx->r9.u32, ctx->r10.u32, ctx->r11.u32, ctx->r31.u32);
         DWORD old;
@@ -286,6 +293,16 @@ namespace
         info->ContextRecord->EFlags |= 0x100;
         t_watch_step = true;
         return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    void start_watch_now(uint32_t address)
+    {
+        g_watch_exact = address;
+        g_watch = address & ~0xFFFu;
+        AddVectoredExceptionHandler(1, watch_handler);
+        DWORD old;
+        VirtualProtect(g_base + g_watch, 0x1000, PAGE_READONLY, &old);
+        log("watch: page %08X (exact %08X)", g_watch, address);
     }
 
     void start_watch()
@@ -304,6 +321,68 @@ namespace
             DWORD old;
             VirtualProtect(g_base + g_watch, 0x1000, PAGE_READONLY, &old);
             log("watch: page %08X", g_watch);
+        }).detach();
+    }
+
+    // TT2_READ_WATCH=<guest address, hex> (debugging): a hardware watchpoint (4 bytes, reads and
+    // writes) on every thread, from TT2_READ_WATCH_DELAY seconds on; logs each new accessing site.
+    LONG CALLBACK read_watch_handler(EXCEPTION_POINTERS* info)
+    {
+        if (info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(info->ContextRecord->Dr6 & 1))
+            return EXCEPTION_CONTINUE_SEARCH;
+        info->ContextRecord->Dr6 = 0;
+        PPCContext* ctx = current_context();
+        const uint32_t fn = kernel::guest_function_at(uintptr_t(info->ExceptionRecord->ExceptionAddress));
+        static std::mutex m;
+        static std::set<std::pair<uint32_t, uint32_t>> seen;
+        std::lock_guard lock(m);
+        if (seen.size() < 64 && seen.insert({ fn, ctx ? uint32_t(ctx->lr) : 0 }).second)
+        {
+            log("read watch: sub_%08X, lr %08llX, stack:%s", fn, (unsigned long long)(ctx ? ctx->lr : 0),
+                ctx ? guest_backtrace(ctx->r1.u32, 16).c_str() : "");
+            if (ctx)
+                log("read watch:   r3 %08X r4 %08X r5 %08X r30 %08X r31 %08X", ctx->r3.u32, ctx->r4.u32, ctx->r5.u32, ctx->r30.u32, ctx->r31.u32);
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    void start_read_watch()
+    {
+        const char* v = std::getenv("TT2_READ_WATCH");
+        if (!v || !*v)
+            return;
+        const uint32_t guest = uint32_t(std::strtoul(v, nullptr, 16)) & ~3u;
+        AddVectoredExceptionHandler(1, read_watch_handler);
+        const char* d = std::getenv("TT2_READ_WATCH_DELAY");
+        const int delay = d ? std::atoi(d) : 0;
+        std::thread([delay, guest] {
+            std::this_thread::sleep_for(std::chrono::seconds(delay));
+            const DWORD self = GetCurrentThreadId();
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            THREADENTRY32 te{ sizeof(te) };
+            int armed = 0;
+            for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te))
+            {
+                if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == self)
+                    continue;
+                HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+                if (!t)
+                    continue;
+                SuspendThread(t);
+                CONTEXT c{};
+                c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                if (GetThreadContext(t, &c))
+                {
+                    c.Dr0 = uintptr_t(g_base) + guest;
+                    c.Dr7 = (c.Dr7 & ~0xF0003ull) | 1 | (3ull << 16) | (3ull << 18); // L0, read/write, 4 bytes
+                    if (SetThreadContext(t, &c))
+                        armed++;
+                }
+                ResumeThread(t);
+                CloseHandle(t);
+            }
+            CloseHandle(snap);
+            log("read watch: %08X on %d threads", guest, armed);
         }).detach();
     }
 
@@ -454,6 +533,11 @@ namespace
     }
 }
 
+namespace tt2
+{
+    void watch_now(uint32_t address) { start_watch_now(address); }
+}
+
 int main(int argc, char** argv)
 {
     const CommandLine cmd = parse(argc, argv);
@@ -569,6 +653,7 @@ int main(int argc, char** argv)
     }
 
     start_watch();
+    start_read_watch();
     start_timer_scan();
     log("starting the game at %08X", g_image.entry);
     auto main_thread = kernel::start_thread(g_image.entry, 0, 0, g_image.stack_size, false, "main");

@@ -8,11 +8,24 @@ compiles it on your PC, then runs it on a small native runtime that stands in fo
 kernel. Nothing from the game ships with this project. You need your own disc, and setup checks
 that you have it.
 
-> **Status: early development, not playable yet.** The recompiled game boots and runs its main
-> loop natively at 60 fps, and rollback works inside the running game. The new Direct3D 11
-> renderer draws the intro movie; menus and fights are still being brought up. Music and voices
-> are silent. See
-> [docs/STATUS.md](docs/STATUS.md) for what works and what's next.
+![A fight running natively](docs/images/fight.jpg)
+
+> **Status: early development.** The recompiled game runs natively at 60 fps with a Direct3D 11
+> renderer: menus, character select, intros and fights all draw. Local versus works, and online
+> matches run in lockstep (in sync, but with input delay). Rollback in fights is still being
+> finished, and music and voices are silent. See [docs/STATUS.md](docs/STATUS.md) for what works
+> and what's next.
+
+## Screenshots
+
+| | |
+| --- | --- |
+| ![Title screen](docs/images/title.jpg) | ![Character select](docs/images/character-select.jpg) |
+| Title screen | Character select |
+| ![Round intro](docs/images/intro.jpg) | ![The launcher](docs/images/launcher.png) |
+| Round intro | The launcher (controller navigation) |
+
+Screenshots are from the native build on a PC, using the author's own copy of the game.
 
 ---
 
@@ -148,7 +161,8 @@ Full list and licenses: [CREDITS.md](CREDITS.md).
 
 This project contains **no** game code, assets or Microsoft/Namco software. It works only with a
 copy of the game you supply yourself, and setup refuses anything that isn't a verified dump of
-the retail disc. Tekken and Tekken Tag Tournament are trademarks of Bandai Namco Entertainment.
+the retail disc. The screenshots in `docs/images` show the game running on this project, for
+illustration only. Tekken and Tekken Tag Tournament are trademarks of Bandai Namco Entertainment.
 This project is not affiliated with or endorsed by Bandai Namco or Microsoft.
 
 Licensed under the [GNU GPL v3.0](LICENSE).

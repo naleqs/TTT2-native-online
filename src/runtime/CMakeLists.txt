@@ -46,6 +46,8 @@ set(TT2_RUNTIME_SOURCES
     rollback/snapshot.cpp
     rollback/game_rollback.cpp
     game/tt2_frame.cpp
+    game/tt2_side_heap.cpp
+    game/tt2_sound_rollback.cpp
     game/tt2_fixes.cpp)
 
 # Logging stubs for every import without a TT2_IMPORT implementation.
@@ -70,7 +72,7 @@ target_compile_options(tt2_ppc PRIVATE
     -O2 -march=x86-64-v3 -fno-strict-aliasing -w
     -include ${CMAKE_CURRENT_SOURCE_DIR}/timebase.h)
 
-add_executable(tt2 ${TT2_RUNTIME_SOURCES} ${TT2_STUBS} $<TARGET_OBJECTS:tt2_ppc>)
+add_executable(tt2 ${TT2_RUNTIME_SOURCES} ${TT2_STUBS} $<TARGET_OBJECTS:tt2_ppc> ${TT2_ICON_RC})
 target_include_directories(tt2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${PPC_DIR} ${TT2_SIMDE_DIR})
 target_compile_options(tt2 PRIVATE -O2 -march=x86-64-v3 -fno-strict-aliasing)
 if(TT2_GAME_VERSION STREQUAL "tu3")

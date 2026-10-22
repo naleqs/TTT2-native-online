@@ -1,5 +1,7 @@
 #include "snapshot.h"
 
+#include <cstdlib>
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -28,6 +30,16 @@ namespace tt2::rollback
     SnapshotRing::SnapshotRing(uint8_t* base, size_t size, int depth)
         : base_(base), size_(size), depth_(depth), state_(size / kPage, kUntracked), ring_(size_t(depth) + 1)
     {
+    }
+
+    std::vector<uint32_t> SnapshotRing::game_pages()
+    {
+        std::lock_guard lock(mutex_);
+        std::vector<uint32_t> out;
+        for (uint32_t page = 0; page < state_.size(); page++)
+            if (state_[page] == kClean || state_[page] == kDirty)
+                out.push_back(page);
+        return out;
     }
 
     SnapshotRing::~SnapshotRing()
@@ -133,10 +145,19 @@ namespace tt2::rollback
         switch (state_[page])
         {
         case kClean:
-            if (simulation_thread)
+            if (was_game_.size() != state_.size())
+                was_game_.assign(state_.size(), false);
+            // A page that held game state stays game state when another thread writes it first:
+            // locks and reference counts inside game objects would otherwise make a page of the
+            // game heap never roll back again (a half-restored heap). Objects other threads own
+            // are kept apart by the side heap and game_rollback's preserved ranges.
+            // TT2_GAME_WINS=0 turns this off (testing).
+            static const bool game_wins = [] { const char* v = std::getenv("TT2_GAME_WINS"); return !v || *v != '0'; }();
+            if (simulation_thread || (game_wins && was_game_[page]))
             {
                 state_[page] = kDirty;
                 dirty_.push_back(page);
+                was_game_[page] = true;
             }
             else
             {

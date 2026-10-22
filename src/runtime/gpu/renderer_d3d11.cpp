@@ -430,13 +430,19 @@ BlitOut vs_blit(uint id : SV_VertexID)
 Texture2D blit_tex : register(t0);
 SamplerState blit_smp : register(s0);
 float4 ps_blit(BlitOut i) : SV_Target { return float4(blit_tex.Sample(blit_smp, i.uv).rgb, 1.0f); }
+// A front buffer resolved with the red/blue swap: shown with the channels back in order.
+float4 ps_blit_swap(BlitOut i) : SV_Target { return float4(blit_tex.Sample(blit_smp, i.uv).bgr, 1.0f); }
 // Resolves drawn as a pass: destination pixel -> source sample (pixel * samples per pixel).
 cbuffer CopyConsts : register(b3) { uint4 copy_scale; };
 Texture2D<float> depth_src : register(t0);
 float ps_depth_copy(BlitOut i) : SV_Target { return depth_src.Load(int3(uint2(i.pos.xy) * copy_scale.xy, 0)); }
 // Colour resolve from a multisampled (sample-resolution) surface: sample 0 of each pixel.
 Texture2D color_src : register(t0);
-float4 ps_color_copy(BlitOut i) : SV_Target { return color_src.Load(int3(uint2(i.pos.xy) * copy_scale.xy, 0)); }
+float4 ps_color_copy(BlitOut i) : SV_Target
+{
+    const float4 v = color_src.Load(int3(uint2(i.pos.xy) * copy_scale.xy, 0));
+    return copy_scale.z != 0 ? v.zyxw : v; // RB_COPY_DEST_INFO swap: red and blue exchanged
+}
 // EDRAM aliasing: the pixels of this surface that lie in EDRAM tiles another surface wrote,
 // fetched from that surface. A tile is tile_width x 16 samples; a surface's row of tiles is
 // pitch / tile_width tiles. edram: this surface's first tile and tiles per row, the other's;
@@ -476,6 +482,7 @@ float4 ps_text(BlitOut i) : SV_Target
         ComPtr<ID3D11GeometryShader> g_gs_rect, g_gs_quad, g_gs_point;
         ComPtr<ID3D11VertexShader> g_vs_blit;
         ComPtr<ID3D11PixelShader> g_ps_blit;
+        ComPtr<ID3D11PixelShader> g_ps_blit_swap;
         ComPtr<ID3D11PixelShader> g_ps_depth_copy;
         ComPtr<ID3D11PixelShader> g_ps_color_copy;
         ComPtr<ID3D11PixelShader> g_ps_edram_copy;
@@ -604,6 +611,7 @@ float4 ps_text(BlitOut i) : SV_Target
             bool depth = false;
             uint64_t frame = 0;
             uint64_t serial = 0; // bumped by every resolve into it
+            bool swapped = false; // red and blue exchanged (RB_COPY_DEST_INFO swap), as in guest memory
         };
         std::map<uint32_t, Resolved> g_resolved;
 
@@ -752,6 +760,9 @@ float4 ps_text(BlitOut i) : SV_Target
                 return b;
             }
             const bool cube = dimension == 3;
+            static const bool no_cube = [] { const char* v = std::getenv("TT2_NO_CUBE"); return v && *v == '1'; }();
+            if (cube && no_cube)
+                return b;
 
             // Render-to-texture: the resolved copy of this address.
             if (auto it = g_resolved.find(base); !cube && it != g_resolved.end())
@@ -1183,7 +1194,9 @@ float4 ps_text(BlitOut i) : SV_Target
                 {
                     const uint8_t* px = row + size_t(x - w.x0) * 4;
                     // k_8_8_8_8: X in the low byte; the swap flag exchanges X and Z.
-                    const uint32_t rr = w.swap ? px[2] : px[0], bb = w.swap ? px[0] : px[2];
+                    // The host copy already has red and blue exchanged when the resolve asked for it.
+                    const bool exchange = w.swap != res.swapped;
+                    const uint32_t rr = exchange ? px[2] : px[0], bb = exchange ? px[0] : px[2];
                     const uint32_t v = gpu_swap(rr | uint32_t(px[1]) << 8 | bb << 16 | uint32_t(px[3]) << 24, w.endian);
                     std::memcpy(view + uint32_t(tiled_2d(x, y, w.pitch, 2)), &v, 4);
                 }
@@ -1373,7 +1386,13 @@ float4 ps_text(BlitOut i) : SV_Target
                 // depth-stencil resources whole, between textures of the same size. Multisampled
                 // colour is copied by a pass too (sample 0 of each pixel).
                 const DXGI_FORMAT dest_format = depth ? DXGI_FORMAT_R32_FLOAT : src->format;
-                const bool by_pass = depth || sx > 1 || sy > 1;
+                // The swap flag exchanges red and blue on the way to memory; the textures fetched
+                // from such copies undo it with their swizzle (ZYXW), so the copy must do it too.
+                const DXGI_FORMAT sf = src->format;
+                const bool swap = !depth && ((r(RB_COPY_DEST_INFO) >> 24) & 1) &&
+                                  (sf == DXGI_FORMAT_R8G8B8A8_UNORM || sf == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || sf == DXGI_FORMAT_R10G10B10A2_UNORM ||
+                                   sf == DXGI_FORMAT_R16G16B16A16_FLOAT || sf == DXGI_FORMAT_R16G16B16A16_UNORM);
+                const bool by_pass = depth || sx > 1 || sy > 1 || swap;
                 if (!res.surface.tex || res.width != dw || res.height != dh || res.surface.format != dest_format)
                 {
                     const uint64_t serial = res.serial; // fetch views compare against it
@@ -1398,6 +1417,7 @@ float4 ps_text(BlitOut i) : SV_Target
                 }
                 res.frame = g_frame;
                 res.serial++;
+                res.swapped = swap;
                 // TT2_GPU_DUMP_ON_RESOLVE=<dest hex>: dump the frame after a resolve there (the Nth burst of
                 // them with TT2_GPU_DUMP_NTH, TT2_GPU_DUMP_DELAY frames later).
                 static const uint32_t dump_on = [] { const char* v = std::getenv("TT2_GPU_DUMP_ON_RESOLVE"); return v ? uint32_t(std::strtoul(v, nullptr, 16)) : 0u; }();
@@ -1441,7 +1461,7 @@ float4 ps_text(BlitOut i) : SV_Target
                                 v.Texture2D.MipLevels = 1;
                                 g_device->CreateShaderResourceView(src->tex.Get(), &v, &src->srv);
                             }
-                            const uint32_t scale[4] = { sx, sy, 0, 0 };
+                            const uint32_t scale[4] = { sx, sy, swap ? 1u : 0u, 0 };
                             update_cbuffer(g_cb_copy.Get(), scale, sizeof(scale));
                             g_ctx->PSSetConstantBuffers(3, 1, g_cb_copy.GetAddressOf());
                             g_ctx->OMSetRenderTargets(1, res.surface.rtv.GetAddressOf(), nullptr); // also unbinds the depth surface
@@ -1787,9 +1807,10 @@ float4 ps_text(BlitOut i) : SV_Target
                     if (dumping())
                     {
                         const uint32_t f0 = r(kFetchConsts + t.slot * 6), f1 = r(kFetchConsts + t.slot * 6 + 1), f2 = r(kFetchConsts + t.slot * 6 + 2);
-                        log("dump:   tf%u dim %u base %08X format %u %ux%u tiled %u -> %s%s", t.slot, t.dimension, f1 & 0x1FFFF000, f1 & 0x3F,
-                            (f2 & 0x1FFF) + 1, ((f2 >> 13) & 0x1FFF) + 1, f0 >> 31, b.srv ? "bound" : "MISSING",
-                            g_resolved.count(f1 & 0x1FFFF000) ? " (resolved)" : "");
+                        const uint32_t sw = (r(kFetchConsts + t.slot * 6 + 3) >> 1) & 0xFFF;
+                        log("dump:   tf%u dim %u base %08X format %u %ux%u tiled %u swizzle %c%c%c%c -> %s%s", t.slot, t.dimension, f1 & 0x1FFFF000, f1 & 0x3F,
+                            (f2 & 0x1FFF) + 1, ((f2 >> 13) & 0x1FFF) + 1, f0 >> 31, "XYZW01??"[sw & 7], "XYZW01??"[(sw >> 3) & 7], "XYZW01??"[(sw >> 6) & 7],
+                            "XYZW01??"[(sw >> 9) & 7], b.srv ? "bound" : "MISSING", g_resolved.count(f1 & 0x1FFFF000) ? " (resolved)" : "");
                         // How much of the texture's first page is non-zero (CPU-generated textures).
                         const uint8_t* raw = phys_ptr(f1 & 0x1FFFF000);
                         uint32_t nonzero = 0;
@@ -2226,6 +2247,8 @@ float4 ps_text(BlitOut i) : SV_Target
             g_device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_ps_depth_copy);
         else
             log("renderer: ps_depth_copy: %s", error.c_str());
+        if (auto code = compile(kFixedHlsl, "ps_blit_swap", "ps_5_0", &error))
+            g_device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_ps_blit_swap);
         if (auto code = compile(kFixedHlsl, "ps_blit", "ps_5_0", &error))
             g_device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_ps_blit);
         D3D11_SAMPLER_DESC smp{};
@@ -2392,7 +2415,7 @@ float4 ps_text(BlitOut i) : SV_Target
             g_ctx->IASetInputLayout(nullptr);
             g_ctx->VSSetShader(g_vs_blit.Get(), nullptr, 0);
             g_ctx->GSSetShader(nullptr, nullptr, 0);
-            g_ctx->PSSetShader(g_ps_blit.Get(), nullptr, 0);
+            g_ctx->PSSetShader(res.swapped && g_ps_blit_swap ? g_ps_blit_swap.Get() : g_ps_blit.Get(), nullptr, 0);
             g_ctx->PSSetShaderResources(0, 1, res.surface.srv.GetAddressOf());
             g_ctx->PSSetSamplers(0, 1, g_blit_sampler.GetAddressOf());
             g_ctx->Draw(3, 0);

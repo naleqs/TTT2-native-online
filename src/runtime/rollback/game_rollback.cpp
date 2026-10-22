@@ -26,6 +26,8 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace tt2
 {
@@ -66,6 +68,62 @@ namespace tt2::rollback
         uint64_t g_time0 = 0;                     // guest time of frame 0
 
         thread_local bool t_simulation = false;   // the thread that runs the main loop
+        thread_local bool t_main = false;         // the main loop's thread, in any pass
+
+        // Threads that run game logic for the main loop (game::game_worker_entries(), plus
+        // TT2_NET_WORKERS_GAME=entry,... for experiments).
+        const std::set<uint32_t>& game_worker_entries()
+        {
+            static const std::set<uint32_t> out = [] {
+                std::set<uint32_t> s;
+                for (uint32_t e : game::game_worker_entries())
+                    s.insert(e);
+                if (const char* v = std::getenv("TT2_NET_WORKERS_GAME"))
+                    for (char* e = const_cast<char*>(v); *e;)
+                    {
+                        s.insert(uint32_t(std::strtoul(e, &e, 16)));
+                        if (*e == ',')
+                            e++;
+                        else
+                            break;
+                    }
+                return s;
+            }();
+            return out;
+        }
+
+        // The game's job threads finish the work the main thread gave them before a frame
+        // boundary's save or a restore (their memory is game state).
+        // A job thread counts as finished only when it waits for new work (game::worker_idle):
+        // blocked on a lock in the middle of a job is not idle.
+        void wait_for_game_workers()
+        {
+            const auto deadline = Clock::now() + std::chrono::milliseconds(200);
+            for (;;)
+            {
+                bool busy = false;
+                kernel::for_each_thread([&](kernel::Thread& t) {
+                    if (game_worker_entries().count(t.routine) && t.started && !t.exited &&
+                        !(t.blocked.load(std::memory_order_acquire) && t.context && game::worker_idle(t.context->r1.u32)))
+                        busy = true;
+                });
+                if (!busy)
+                    return;
+                if (Clock::now() >= deadline)
+                {
+                    static int logged = 0;
+                    if (logged++ < 5)
+                        log("rollback: a job thread is still working; going on anyway");
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+        }
+        std::atomic<bool> g_main_thread_known{ false };
+
+        // Diagnostics: which threads (by entry point) made pages foreign.
+        std::mutex g_foreign_by_mutex;
+        std::map<uint32_t, int> g_foreign_by;
 
         // Write faults on write-protected game pages decide whose page it is (snapshot.h).
         // True while the ring is being replaced: a write to a page the old ring still protects
@@ -78,8 +136,33 @@ namespace tt2::rollback
             if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec->NumberParameters < 2 || rec->ExceptionInformation[0] != 1)
                 return EXCEPTION_CONTINUE_SEARCH;
             SnapshotRing* ring = g_ring_ptr.load(std::memory_order_acquire);
-            if (ring && ring->on_write_fault(rec->ExceptionInformation[1], t_simulation))
+            // The main loop's update and the game's job threads (character movement) write game
+            // state. Writes from the sound library or the job library (directly, or through
+            // memcpy/memset they call) are not, on any thread: the sound thread and the job pool
+            // work on that memory concurrently, so it is never rolled back.
+            bool simulation = t_simulation;
+            const bool worker = !t_main && ring && is_game_thread();
+            if (worker)
+                simulation = true;
+            if (simulation && ring)
+            {
+                const uint32_t fn = kernel::guest_function_at(uintptr_t(info->ExceptionRecord->ExceptionAddress));
+                const PPCContext* ctx = current_context();
+                if (game::is_sound_code(fn) || (ctx && game::is_sound_code(uint32_t(ctx->lr))) ||
+                    game::is_job_queue_code(fn) || (ctx && game::is_job_queue_code(uint32_t(ctx->lr))))
+                    simulation = false;
+            }
+            if (ring && !t_main && ring->is_clean(rec->ExceptionInformation[1]))
+            {
+                const auto me = kernel::current_thread();
+                const uint32_t entry = me ? me->routine : 0;
+                std::lock_guard lock(g_foreign_by_mutex);
+                g_foreign_by[simulation ? entry | 1 : entry]++;
+            }
+            if (ring && ring->on_write_fault(rec->ExceptionInformation[1], simulation))
+            {
                 return EXCEPTION_CONTINUE_EXECUTION;
+            }
             const uintptr_t addr = rec->ExceptionInformation[1];
             if (g_ring_switching.load(std::memory_order_acquire) && addr >= uintptr_t(g_base) + 0x10000 && addr < uintptr_t(g_base) + PPC_MEMORY_SIZE)
             {
@@ -90,6 +173,7 @@ namespace tt2::rollback
         }
         FrameRegs g_regs;
         std::atomic<bool> g_resim{ false };
+        bool g_rolling_back = false;
 
 
         // frame inputs (frozen at the boundary)
@@ -201,6 +285,19 @@ namespace tt2::rollback
                 g_ring->exclude(ring, ring + bytes);
             for (auto [b, e] : game::excluded_from_rollback())
                 g_ring->exclude(b, e);
+            // TT2_EXCLUDE=begin-end,... (hex, experiments): more ranges that never roll back.
+            if (const char* v = std::getenv("TT2_EXCLUDE"))
+                for (char* p = const_cast<char*>(v); *p;)
+                {
+                    const uint32_t b = uint32_t(std::strtoul(p, &p, 16));
+                    if (*p != '-')
+                        break;
+                    const uint32_t e = uint32_t(std::strtoul(p + 1, &p, 16));
+                    g_ring->exclude(b, e);
+                    if (*p != ',')
+                        break;
+                    p++;
+                }
             if (const uint32_t ts = timestamp_bundle())
                 g_ring->exclude(ts & ~0xFFFu, (ts & ~0xFFFu) + 0x1000);
             // Thread stacks are not game state either. The simulation thread's stack holds only
@@ -275,9 +372,13 @@ namespace tt2::rollback
             g_hashlog.clear();
         }
 
+        int g_learn_frames = 0;
+
         void save(int frame)
         {
             const auto t0 = Clock::now();
+            wait_for_game_workers();
+            game::check_fight(frame - 1);
             apply_pending_tracks();
             g_ring->save(frame);
             static const bool hashlog = [] { const char* v = std::getenv("TT2_NET_HASHLOG"); return v && *v == '1'; }();
@@ -307,16 +408,31 @@ namespace tt2::rollback
             g_saves++;
         }
 
+        std::mutex g_preserve_mutex;
+        std::map<uint32_t, uint32_t> g_preserve; // address -> size
+
         bool load(int frame)
         {
             const auto t0 = Clock::now();
-            if (!kernel::wait_until_blocked(game::render_thread_entry(), 50))
+            wait_for_game_workers();
+            std::vector<std::pair<uint32_t, std::vector<uint8_t>>> kept;
+            {
+                std::lock_guard lock(g_preserve_mutex);
+                for (auto [a, n] : g_preserve)
+                    kept.push_back({ a, std::vector<uint8_t>(g_base + a, g_base + a + n) });
+            }
+            static const int render_wait = [] { const char* v = std::getenv("TT2_RENDER_WAIT_MS"); return v ? std::atoi(v) : 200; }();
+            if (!kernel::wait_until_blocked(game::render_thread_entry(), render_wait))
             {
                 static int logged = 0;
                 if (logged++ < 5)
-                    log("rollback: the render thread is still busy; restoring anyway");
+                    log("rollback: the job pool is still busy; restoring anyway");
             }
             const bool ok = g_ring->load(frame);
+            game::sounds_on_rollback();
+            for (auto& [a, bytes] : kept)
+                if (std::memcmp(g_base + a, bytes.data(), bytes.size()) != 0)
+                    std::memcpy(g_base + a, bytes.data(), bytes.size());
             g_load_ms += ms_since(t0);
             if (!ok)
                 log("rollback: frame %d is no longer in the snapshot ring", frame);
@@ -455,10 +571,20 @@ namespace tt2::rollback
                 const int target = k - g_stress_depth;
                 if (load(target))
                 {
+                    g_rolling_back = true;
                     const auto t0 = Clock::now();
                     for (int f = target; f < k; f++)
                     {
-                        resimulate(f, g_inputs[f % kRing]);
+                        // TT2_STRESS_ALTER=1 (or 2): re-run with player 1 (or 2) holding forward + X
+                        // instead (re-runs must react to corrected inputs: the fight check shows it,
+                        // and the other player must not change until they touch).
+                        static const int alter = [] { const char* v = std::getenv("TT2_STRESS_ALTER"); return v ? std::atoi(v) : 0; }();
+                        FrameInput in = g_inputs[f % kRing];
+                        if (alter == 1 || alter == 2)
+                            in.pads[alter - 1].buttons = 0x0008 | 0x4000; // DPAD_RIGHT | X
+                        g_frame = f;
+                        resimulate(f, in);
+                        g_frame = k;
                         save(f + 1);
                         if (g_orig_frame[(f + 1) % kRing] == f + 1 && g_ring->last_delta_hash() != g_orig_hash[(f + 1) % kRing])
                         {
@@ -502,6 +628,7 @@ namespace tt2::rollback
                         g_resim_frames++;
                     }
                     g_resim_ms += ms_since(t0);
+                    g_rolling_back = false;
                     g_rollbacks++;
                 }
             }
@@ -513,12 +640,16 @@ namespace tt2::rollback
             lock_time(k);
             g_frame_serial++;
 
-            if (k > 0 && k % 600 == 0)
+            if (k > 0 && k % 150 == 0)
             {
                 log("rollback stress: frame %d, %llu rollbacks (%llu frames re-run), %llu mismatching frames, %zu foreign pages, save %.2f ms/frame, load %.2f ms, re-run %.2f ms/frame",
                     k, (unsigned long long)g_rollbacks, (unsigned long long)g_resim_frames, (unsigned long long)g_mismatches, g_ring->foreign_pages(),
                     g_saves ? g_save_ms / g_saves : 0.0, g_rollbacks ? g_load_ms / g_rollbacks : 0.0,
                     g_resim_frames ? g_resim_ms / g_resim_frames : 0.0);
+                log("rollback stress: %s", game::side_heap_stats().c_str());
+                std::lock_guard lock(g_foreign_by_mutex);
+                for (auto [entry, n] : g_foreign_by)
+                    log("rollback stress:   %d pages first written by the thread at %08X%s", n, entry & ~1u, entry & 1 ? " (kept as game state)" : "");
             }
             set_status("rollback stress: " + std::to_string(g_rollbacks) + " rollbacks, " + std::to_string(g_mismatches) + " mismatches");
             g_frame = k + 1;
@@ -549,6 +680,7 @@ namespace tt2::rollback
                 return 0;
             };
             cb.load_state = [](int frame) {
+                g_rolling_back = true;
                 if (!load(frame))
                     fatal("rollback: cannot restore frame %d", frame);
                 g_frame = frame;
@@ -670,6 +802,23 @@ namespace tt2::rollback
                 g_session->end_frame();
             g_frame_open = false;
 
+            // Learning (right after the battle's snapshots start, in lockstep): every game page is
+            // write-protected now, so the threads that write while the main thread pauses here (the
+            // sound engine, which shares memory with the game logic) mark their pages as theirs,
+            // never rolled back.
+            if (g_learn_frames > 0)
+            {
+                g_learn_frames--;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                if (g_learn_frames == 0 && g_ring)
+                {
+                    log("netplay: learned the other threads' memory: %zu foreign pages", g_ring->foreign_pages());
+                    std::lock_guard lock(g_foreign_by_mutex);
+                    for (auto [entry, n] : g_foreign_by)
+                        log("netplay:   %d pages first written by the thread at %08X%s", n, entry & ~1u, entry & 1 ? " (kept as game state)" : "");
+                }
+            }
+
             // Did the battle scene run in the frame that just ended? The battle scene starts with
             // the VS screen while the stage and characters load; rollback waits until nothing has
             // been read from disc for 2 seconds (restoring memory under a loader would break it).
@@ -698,6 +847,7 @@ namespace tt2::rollback
             {
                 battle_snapshots = true;
                 restart_snapshots(g_session->frame());
+                g_learn_frames = 120;
             }
 
             if (g_phase == Phase::Lockstep && in_battle && battle_snapshots && ticking)
@@ -723,6 +873,7 @@ namespace tt2::rollback
                 const int frame = g_session->frame();
                 g_frame = frame;
                 const auto result = g_session->begin_frame(local, in); // may roll back and re-run frames
+                g_rolling_back = false;
                 if (result == netplay::FrameResult::Run && g_phase == Phase::Barrier)
                 {
                     if ((in[0] & in[1] & netplay::button::sync_ready) != 0)
@@ -773,6 +924,8 @@ namespace tt2::rollback
                 const auto s = g_session->stats();
                 log("netplay: frame %d, ping %d ms, delay %d, %llu frames waited, %llu rollbacks", g_session->frame(), s.rtt_ms, s.input_delay,
                     (unsigned long long)s.frames_waited, (unsigned long long)s.rollbacks);
+                log("netplay: %s", game::side_heap_stats().c_str());
+                log("netplay: %s", game::sound_rollback_stats().c_str());
             }
             if (g_session->frame() % 60 == 0)
             {
@@ -785,7 +938,9 @@ namespace tt2::rollback
 
     void draw_pass(bool drawing)
     {
-        if (g_mode != Mode::Off)
+        // TT2_DRAW_IS_GAME=1 (experiment): everything the main thread writes is game state.
+        static const bool draw_is_game = [] { const char* v = std::getenv("TT2_DRAW_IS_GAME"); return v && *v == '1'; }();
+        if (g_mode != Mode::Off && !draw_is_game)
             t_simulation = !drawing;
     }
 
@@ -807,6 +962,9 @@ namespace tt2::rollback
     {
         g_regs = regs;
         t_simulation = true;
+        t_main = true;
+        g_main_thread_known.store(true, std::memory_order_release);
+        game::flush_deferred_frees();
         if (!g_time0)
             g_time0 = timebase_now();
         switch (g_mode)
@@ -874,6 +1032,51 @@ namespace tt2::rollback
         // Re-simulated frames tick too; only live frames count.
         if (!g_resim)
             g_round_ticks.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    bool main_thread_known()
+    {
+        return g_main_thread_known.load(std::memory_order_acquire);
+    }
+
+    bool is_game_thread()
+    {
+        if (t_main)
+            return true;
+        thread_local int cached = -1;
+        if (cached < 0)
+        {
+            const auto me = kernel::current_thread();
+            cached = me && game_worker_entries().count(me->routine) ? 1 : 0;
+        }
+        return cached == 1;
+    }
+
+    bool simulating_now()
+    {
+        return t_main ? t_simulation : is_game_thread();
+    }
+
+    void preserve(uint32_t address, uint32_t size)
+    {
+        std::lock_guard lock(g_preserve_mutex);
+        auto& n = g_preserve[address];
+        n = std::max(n, size);
+    }
+
+    bool rolling_back()
+    {
+        return g_rolling_back;
+    }
+
+    bool snapshots_active()
+    {
+        return g_ring_ptr.load(std::memory_order_acquire) != nullptr;
+    }
+
+    bool on_main_thread()
+    {
+        return t_main;
     }
 
     int current_frame(uint64_t* serial)

@@ -55,10 +55,19 @@ namespace tt2::rollback
         // (ReadFile into protected memory fails inside the kernel instead of faulting).
         void before_host_write(uint32_t address, uint32_t size, bool simulation_thread);
 
+        // Pages currently classified as game state (tracked, not foreign or excluded).
+        std::vector<uint32_t> game_pages();
+
         // Diagnostics
         size_t pages_last_save() const { return pages_last_save_; }
         size_t shadow_bytes() const { return shadow_.size() * kPage; }
         size_t foreign_pages() const { return foreign_count_; }
+        // True when the page holding `host_address` is tracked and not written since the last save.
+        bool is_clean(uintptr_t host_address) const
+        {
+            const uintptr_t b = reinterpret_cast<uintptr_t>(base_);
+            return active_ && host_address >= b && host_address < b + size_ && state_[(host_address - b) / kPage] == kClean;
+        }
         // Hash of what the last saved frame changed (page numbers and contents).
         uint64_t last_delta_hash() const { return last_delta_hash_; }
         // Pages changed by the last saved frame with a hash of their new content (diagnostics).
@@ -96,6 +105,7 @@ namespace tt2::rollback
         int oldest_ = -1;
 
         std::vector<uint8_t> state_;        // per guest page
+        std::vector<bool> was_game_;        // written by the simulation at some point (stays game state)
         std::vector<std::pair<uint32_t, uint32_t>> tracked_, pending_track_, excluded_;
         std::unordered_map<uint32_t, std::unique_ptr<uint8_t[]>> shadow_;
         std::vector<Record> ring_;

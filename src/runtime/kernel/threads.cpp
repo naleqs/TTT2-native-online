@@ -1,6 +1,7 @@
 #include "threads.h"
 #include "../image.h"
 #include "../memory.h"
+#include "../rollback/game_rollback.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -144,6 +145,7 @@ namespace tt2::kernel
         t->start_address = start_address;
         t->start_context = start_context;
         t->xapi_startup = xapi_startup;
+        t->routine = game::thread_routine(start_address, start_context);
         t->suspend_count = suspended ? 1 : 0;
         t->name = name ? name : "";
         register_body(t, 0);
@@ -236,13 +238,25 @@ namespace tt2::kernel
         {
             bool busy = false;
             for_each_thread([&](Thread& t) {
-                if (t.start_address == start_address && t.started && !t.exited && t.blocked.load(std::memory_order_acquire) == 0)
+                if ((t.start_address == start_address || t.routine == start_address) && t.started && !t.exited &&
+                    t.blocked.load(std::memory_order_acquire) == 0 && !(t.context && game::thread_waiting_in_guest(t.context->r1.u32)))
                     busy = true;
             });
             if (!busy)
                 return true;
             if (std::chrono::steady_clock::now() >= deadline)
+            {
+                static int logged = 0;
+                if (logged++ < 3)
+                    for_each_thread([&](Thread& t) {
+                        if ((t.start_address == start_address || t.routine == start_address) && t.started && !t.exited &&
+                            t.blocked.load(std::memory_order_acquire) == 0)
+                            log("threads: t%u (%08X) is not blocked: frozen %d, suspend count %d, in %s, lr %08X", t.id, start_address,
+                                t.frozen ? 1 : 0, t.suspend_count, t.current_import && *t.current_import ? *t.current_import : "guest code",
+                                t.context ? uint32_t(t.context->lr) : 0);
+                    });
                 return false;
+            }
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
     }

@@ -15,6 +15,7 @@ namespace tt2::kernel
         uint32_t stack_size = 0;
         uint32_t static_tls = 0;     // copy of the image's __declspec(thread) data
         uint32_t start_address = 0, start_context = 0, xapi_startup = 0;
+        uint32_t routine = 0;        // the thread's own function (game::thread_routine)
         bool exited = false;
         uint32_t exit_code = 0;
         int suspend_count = 0;

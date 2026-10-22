@@ -1,6 +1,6 @@
 # Project status
 
-Last updated: 2026-10-17, version 0.1.0.
+Last updated: 2026-10-22, version 0.1.0.
 
 ## Summary
 
@@ -16,7 +16,7 @@ Last updated: 2026-10-17, version 0.1.0.
 | Rollback session | ✅ Tested: bit-identical over 3,600 frames at up to 160 ms with 10% packet loss |
 | Guest memory snapshots | ✅ Tested: exact restores, including memory written by other threads |
 | Rollback in the game | ✅ Works in the running game: 480 rollbacks / 1,440 re-run frames with no crash or hang at 60 fps; 0.07 ms save, 0.2 ms load, 0.3 ms per re-run frame |
-| Netplay between two game instances | ✅ Two instances on one PC connect over UDP and run the game in lockstep with rollback enabled |
+| Netplay between two game instances | ✅ Two instances on one PC (Title Update 3 build): menus in lockstep, rounds with rollback. A full two-round VS match with 1,596 re-run frames stayed in sync: same health on every frame, both rounds over on the same frames as in lockstep, no crash |
 | P2P lobby (trackers + WebRTC) | ✅ Tested through the real public trackers: discovery, WebRTC connection, challenge/accept, 200/200 match datagrams (`tt2_lobby_smoke`, two peers on one PC). A test across two networks is still to do |
 | Launcher | ✅ Controller navigation, setup, local, lobby, direct connect, settings |
 
@@ -42,15 +42,32 @@ Last updated: 2026-10-17, version 0.1.0.
 
 ## Known issues
 
-- **Netplay runs in lockstep from boot** (no rollback yet: menus lose inputs when rolled back).
-  Menus, VS character select and stage select stay identical on both PCs. Random choices (random
-  stage, intro animations) still differ, so a VS match currently needs a fixed stage, and the
-  fights themselves are not yet confirmed to stay in sync. Next: find the state those random
-  numbers come from (two counters differ by one frame between the PCs), then fight start
-  detection to turn rollback on in fights.
+- **Rollback only in rounds, Title Update 3 only so far.** Menus, intros and KOs run in lockstep
+  and each round starts at a sync point. Tested on one PC (two instances); a test across two PCs
+  is still to do, and the addresses for the base game version are still to be found.
+- **Rollback and the game's threads.** The fight runs in the scene update (`sub_825E04F0`, which
+  re-run frames repeat) and in the game's job threads (character movement). Memory is rolled back
+  per page; what other threads own is kept apart: their heap blocks go to a side heap, the job
+  pool's, loaders' and sound library's writes never roll back, and objects of theirs that share a
+  page with game state are kept as they are (see `src/runtime/game/tt2_side_heap.cpp` and
+  `tt2_frame.cpp`).
+- **Sound and rollback:** as in Tekken6-rollback, sound ignores rollbacks. A sound effect a re-run
+  frame plays again gets the handle of the one already playing (same sound within 3 frames), any
+  other is not started (`src/runtime/game/tt2_sound_rollback.cpp`). A sound only the corrected
+  timeline has is not heard.
+- **A see-through yellow layer in fights** (around the health bars, and over the whole winner
+  screen). It comes from the glow (bloom) post-process: its bright pass (glow draw 3 of 4) weighs
+  the scene by its colour, its alpha and a depth texture (a float depth resolve, read as
+  `k_24_8_FLOAT`), and one of these inputs is wrong in the renderer, so the glow covers more than
+  it should. Some of the glow chain's intermediate targets also show stale EDRAM data.
+- **Small float differences between the two games** (positions up to a few units apart, health and
+  round results identical), also in lockstep: the same match on two PCs is not bit-identical.
 - **Occasional crash in controller-slot code** (`sub_8241ABC0`/`sub_82420C40`, a slot pointer of
   -1). Netplay's player 2 sign-in mismatch was one cause and is fixed; it has also been seen once
   without netplay.
+- **Long stall when a character is tagged in** during a match: the game freezes and buffers
+  heavily. Probably the incoming character's data loading or its shaders compiling on first use.
+- **Some stage backgrounds and water shaders render incorrectly.**
 - **No desync detection in the game yet.** The session supports checksums, but the per-frame
   memory hash also includes presentation pages, so it is turned off.
 - Some intro or attract sequences use a movie player with its own threads. They survive rollback
@@ -74,8 +91,11 @@ Last updated: 2026-10-17, version 0.1.0.
    consumes buffers and outputs silence is in place.
 4. **File system details:** `\Device\Image`, `\Device\Harddisk0\partition0` and
    `NtQueryInformationFile` class 27.
-5. **Lobby across two networks** (different NATs) and more tracker fallbacks.
-6. The 4 `vpkd3d128 ...,5,3,0` sites (64-bit float16 pack, mode 3) emit a warning; they need a
+5. **Character customization online:** each player's customized outfits and colours should show
+   on both PCs. The two games' saved customizations differ, so they need to be exchanged at match
+   start.
+6. **Lobby across two networks** (different NATs) and more tracker fallbacks.
+7. The 4 `vpkd3d128 ...,5,3,0` sites (64-bit float16 pack, mode 3) emit a warning; they need a
    correct implementation in `tools/recomp-patches`.
 
 ## Fixes for timing problems in the game
@@ -111,7 +131,12 @@ every other boot on a fast PC.
 | `TT2_WATCH=hex` | Log the guest functions that write that page of guest memory (an unaligned address: only writes to its 16 bytes) |
 | `TT2_INSTANCE=name` | Keep hard disk, cache and saves in `native\instances\<name>` (two games on one PC) |
 | `TT2_NET_DUMP=frame,...` | Netplay: write the game's data and heaps at those frames to `native\logs` (diff two players' dumps) |
-| `TT2_NET_PREDICTION=n` | Netplay: allow `n` frames of prediction (rollback) instead of lockstep |
+| `TT2_NET_PREDICTION=n` | Netplay: allow `n` frames of prediction (rollback) instead of lockstep (also in menus, which is not supported) |
+| `TT2_FIGHT_CHECK=1` | Log the fighters' health and positions every second, and every re-run frame that ends differently from its first run (`TT2_FIGHT_LOG_ALL=1`: every frame, to compare two players' logs) |
+| `TT2_STRESS_ALTER=1` | Stress test: re-run frames with other inputs for player 1 (the fight must react) |
+| `TT2_READ_WATCH=hex` | Hardware watchpoint: log every function that reads or writes those 4 bytes |
+| `TT2_EXCLUDE=begin-end,...` | Rollback: more guest ranges that never roll back (experiments) |
+| `TT2_SCENE_STEP_GAME=0`, `TT2_GAME_WINS=0`, `TT2_SIDE_HEAP=0`, `TT2_SOUND_ROLLBACK=0` | Rollback: turn off re-running the scene update, the "a page that held game state stays game state" rule, the side heap, or the sound handling (testing) |
 | `TT2_INPUT_SCRIPT=ms=button[:hold_ms],...` | Press player 1's buttons at fixed times after start (in netplay: game frames), for unattended tests |
 
 ## Known limitations
