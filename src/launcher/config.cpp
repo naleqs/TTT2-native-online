@@ -79,6 +79,7 @@ namespace tt2::launcher
                 c.name = j.value("name", c.name);
                 c.room = j.value("room", c.room);
                 c.fullscreen = j.value("fullscreen", c.fullscreen);
+                c.check_updates = j.value("check_updates", c.check_updates);
                 c.input_delay = j.value("input_delay", c.input_delay);
                 c.local_port = j.value("local_port", c.local_port);
                 c.direct_peer = j.value("direct_peer", c.direct_peer);
@@ -94,6 +95,7 @@ namespace tt2::launcher
             { "name", c.name },
             { "room", c.room },
             { "fullscreen", c.fullscreen },
+            { "check_updates", c.check_updates },
             { "input_delay", c.input_delay },
             { "local_port", c.local_port },
             { "direct_peer", c.direct_peer },

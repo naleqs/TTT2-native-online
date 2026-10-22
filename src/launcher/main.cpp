@@ -6,6 +6,7 @@
 #include "config.h"
 #include "osk.h"
 #include "process.h"
+#include "update_check.h"
 
 #include <tt2/netplay/transport.h>
 #ifdef TT2_WITH_LOBBY
@@ -17,6 +18,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <shellapi.h>
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_sdlrenderer3.h>
@@ -171,6 +173,13 @@ namespace
         else
         {
             ImGui::Text("Game: %s   build %s", app.build->version.c_str(), app.build->build_id.c_str());
+            if (const auto update = available_update())
+            {
+                ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.25f, 1.0f), "Update available: version %s (you have %s).", update->version.c_str(),
+                                   TT2_LAUNCHER_VERSION);
+                if (big_button("Open the download page"))
+                    ShellExecuteA(nullptr, "open", update->url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            }
             ImGui::Spacing();
             ImGui::TextDisabled("In the game, hold Back for 2 seconds to come to the online lobby.");
             if (big_button("Local versus (2 controllers)"))
@@ -429,6 +438,8 @@ namespace
             });
         if (big_button(app.config.fullscreen ? "Display: fullscreen" : "Display: window"))
             app.config.fullscreen = !app.config.fullscreen;
+        if (big_button(app.config.check_updates ? "Check for updates at start: on" : "Check for updates at start: off"))
+            app.config.check_updates = !app.config.check_updates;
         char delay[64];
         if (app.config.input_delay < 0)
             snprintf(delay, sizeof(delay), "Input delay: automatic");
@@ -488,6 +499,8 @@ int main(int argc, char** argv)
     fs::create_directories(app.native, ec);
     app.config = load_config(app.native / "launcher.json", app.root / ".env");
     refresh_build(app);
+    if (app.config.check_updates)
+        start_update_check(TT2_LAUNCHER_VERSION);
 #ifdef TT2_WITH_LOBBY
     // --lobby: the game asked for the lobby (its Back shortcut, when it was started on its own).
     for (int i = 1; i < argc; i++)

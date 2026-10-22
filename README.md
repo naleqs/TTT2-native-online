@@ -85,6 +85,9 @@ Everything in the launcher works with a controller: D-pad or stick to move, **A*
 - **Direct connect**: enter your opponent's IP address, for LAN play, a forwarded port or a VPN
   such as Tailscale.
 
+At start the launcher asks GitHub whether a newer release exists and, if so, says so in the main
+menu with a button to the download page. Settings can turn this check off.
+
 ### Netcode
 
 Online matches use **rollback netcode** in the style of GGPO, following the approach of

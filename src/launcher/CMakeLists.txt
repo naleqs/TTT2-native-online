@@ -8,8 +8,10 @@ add_executable(tt2-launcher WIN32
     config.cpp
     osk.cpp
     process.cpp
+    update_check.cpp
     ${TT2_ICON_RC})
-target_link_libraries(tt2-launcher PRIVATE tt2_imgui tt2_netplay nlohmann_json::nlohmann_json windowscodecs ole32 comdlg32)
+target_link_libraries(tt2-launcher PRIVATE tt2_imgui tt2_netplay nlohmann_json::nlohmann_json windowscodecs ole32 comdlg32 winhttp shell32)
+target_compile_definitions(tt2-launcher PRIVATE TT2_LAUNCHER_VERSION="${PROJECT_VERSION}")
 if(TARGET tt2_lobby)
     target_link_libraries(tt2-launcher PRIVATE tt2_lobby)
 endif()

@@ -135,6 +135,7 @@ every other boot on a fast PC.
 | `TT2_FIGHT_CHECK=1` | Log the fighters' health and positions every second, and every re-run frame that ends differently from its first run (`TT2_FIGHT_LOG_ALL=1`: every frame, to compare two players' logs) |
 | `TT2_STRESS_ALTER=1` | Stress test: re-run frames with other inputs for player 1 (the fight must react) |
 | `TT2_READ_WATCH=hex` | Hardware watchpoint: log every function that reads or writes those 4 bytes |
+| `TT2_UPDATE_REPO=owner/name` | Launcher: check that GitHub repository's latest release instead of this project's (testing the update notice) |
 | `TT2_EXCLUDE=begin-end,...` | Rollback: more guest ranges that never roll back (experiments) |
 | `TT2_SCENE_STEP_GAME=0`, `TT2_GAME_WINS=0`, `TT2_SIDE_HEAP=0`, `TT2_SOUND_ROLLBACK=0` | Rollback: turn off re-running the scene update, the "a page that held game state stays game state" rule, the side heap, or the sound handling (testing) |
 | `TT2_INPUT_SCRIPT=ms=button[:hold_ms],...` | Press player 1's buttons at fixed times after start (in netplay: game frames), for unattended tests |

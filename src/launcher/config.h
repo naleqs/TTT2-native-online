@@ -13,6 +13,7 @@ namespace tt2::launcher
         std::string name = "Player";
         std::string room = "public";
         bool fullscreen = false;
+        bool check_updates = true;      // ask GitHub for a newer release at start
         int input_delay = -1;           // -1 = automatic
         unsigned local_port = 7000;
         std::string direct_peer;        // "ip:port"
