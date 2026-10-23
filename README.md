@@ -45,7 +45,8 @@ Screenshots are from the native build on a PC, using the author's own copy of th
 2. Put your disc image in the **`iso`** folder. Optionally, put your own title update and DLC
    packages in the **`dlc`** folder (see below).
 3. Run **`TTT2 Native Online.exe`** and choose **Set up the game**. You can also run
-   **`Setup.bat`** directly.
+   **`Setup.bat`** directly (from a copy of the source code, which has no launcher yet: setup
+   builds it and puts `TTT2 Native Online.exe` in the folder, next to `Setup.bat`).
 4. Setup then runs on its own, which takes about 5 to 10 minutes. It:
    - verifies every game file against known checksums while copying it into `native\game`
      (other versions or modified dumps are refused)

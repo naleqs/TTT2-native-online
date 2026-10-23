@@ -18,7 +18,7 @@ Options:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `TT2_BUILD_LAUNCHER` | ON | Build `TTT2 Native Online.exe` |
+| `TT2_BUILD_LAUNCHER` | ON | Build `TTT2 Native Online.exe`. Every build also copies it to the repository root, next to `Setup.bat` (a running launcher is left as it is, with a warning) |
 | `TT2_WITH_WEBRTC` | ON | Include the online lobby (libdatachannel) |
 | `TT2_BUILD_TESTS` | ON | Build `tt2_rollback_test` and `tt2_snapshot_test` |
 | `TT2_BUILD_GAME` | OFF | Build `tt2.exe`. Needs `TT2_RECOMP_DIR` and `TT2_SIMDE_DIR`, which `Setup.bat` provides |

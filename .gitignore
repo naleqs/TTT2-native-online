@@ -17,6 +17,9 @@ dlc/*
 # code, compiled game, downloaded toolchain, logs)
 native/
 
+# The launcher, which every build and Setup.bat copy into the root folder
+/TTT2 Native Online.exe
+
 # Generated recompiler output and analysis (derived from the game binary)
 ppc/
 tt2_recomp.toml

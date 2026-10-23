@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     First-time setup for TTT2 Native Online: verifies YOUR copy of Tekken Tag Tournament 2
     (Xbox 360), copies its data into this folder and builds the native game on this PC.
@@ -331,6 +331,13 @@ function Invoke-Build {
     Invoke-Native 'cmake' (@('-S', $Root, '-B', $gameBuild, '-DTT2_BUILD_GAME=ON', '-DTT2_BUILD_LAUNCHER=OFF', '-DTT2_BUILD_TESTS=OFF',
         "-DTT2_RECOMP_DIR=$recomp", "-DTT2_SIMDE_DIR=$simde", "-DTT2_OUTPUT_DIR=$BinDir", "-DTT2_GAME_VERSION=$gameVersion") + $common) 'Configuring the game build'
     Invoke-Native 'cmake' @('--build', $gameBuild, '--target', 'tt2', '--parallel', "$Jobs") 'Compiling the game'
+
+    # The launcher ('TTT2 Native Online.exe'), built here too so that everyone has it in this folder
+    # (its build copies it next to Setup.bat; one that is running stays until the next build).
+    Write-Step 'Building the launcher'
+    $launcherBuild = Join-Path $BuildDir 'launcher'
+    Invoke-Native 'cmake' (@('-S', $Root, '-B', $launcherBuild, '-DTT2_BUILD_GAME=OFF', '-DTT2_BUILD_LAUNCHER=ON', '-DTT2_BUILD_TESTS=OFF') + $common) 'Configuring the launcher'
+    Invoke-Native 'cmake' @('--build', $launcherBuild, '--target', 'tt2-launcher', '--parallel', "$Jobs") 'Compiling the launcher'
 }
 
 # ------------------------------------------------------------------------------ 5. DLC and title updates
