@@ -630,6 +630,7 @@ float4 ps_text(BlitOut i) : SV_Target
         // TT2_GPU_DUMP_FRAME=N: log every draw, texture and resolve of frame N and write the
         // HLSL of its shaders to native\gpu\dump.
         uint64_t g_dump_frame = ~0ull;
+        uint64_t g_dump_every = 0; // TT2_GPU_DUMP_EVERY=n: dump again every n frames
         fs::path g_dump_dir;
         // TT2_GPU_TRACE_BASE=hex (with the dump output): dump every draw into that EDRAM base and
         // every resolve from it, in any frame (up to 600 of them).
@@ -1268,8 +1269,18 @@ float4 ps_text(BlitOut i) : SV_Target
             const uint32_t s_tpr = std::max(1u, s.width / s.tile_width);
             std::vector<Surface*> newer;
             for (auto& [key, o] : g_render_targets)
-                if (&o != &s && !o.depth && o.written > s.written && o.tile_width == s.tile_width && o.used_rows && o.tex)
+            {
+                // Pixels are carried over only between surfaces of the same format: the copy converts
+                // values, where the hardware would keep the raw bits. A two-channel float target
+                // (16_16_FLOAT) carried into a colour target came out as red + green, which the depth
+                // of field blended over the background as a yellow layer (top of the screen in fights,
+                // the whole winner screen). The game overwrites such areas anyway.
+                // TT2_EDRAM_SAME_FORMAT=0 carries over between formats too (testing).
+                static const bool same_format = [] { const char* v = std::getenv("TT2_EDRAM_SAME_FORMAT"); return !v || *v != '0'; }();
+                if (&o != &s && !o.depth && o.written > s.written && o.tile_width == s.tile_width && o.used_rows && o.tex &&
+                    (!same_format || o.format == s.format))
                     newer.push_back(&o);
+            }
             if (newer.empty())
                 return;
             std::sort(newer.begin(), newer.end(), [](Surface* a, Surface* b) { return a->written < b->written; });
@@ -1828,6 +1839,27 @@ float4 ps_text(BlitOut i) : SV_Target
             bind_textures(vm, vs_srvs, vs_smps, vs_max);
             if (!depth_only)
                 bind_textures(pm, ps_srvs, ps_smps, ps_max);
+            // TT2_GPU_SKIP_TEX=hex,... (debugging): leave out every draw that samples one of these
+            // texture addresses (to see what a pass contributes to the picture).
+            {
+                static const std::vector<uint32_t> skip = [] {
+                    std::vector<uint32_t> out;
+                    if (const char* v = std::getenv("TT2_GPU_SKIP_TEX"))
+                        for (char* e = const_cast<char*>(v); *e;)
+                        {
+                            out.push_back(uint32_t(std::strtoul(e, &e, 16)) & 0x1FFFF000);
+                            if (*e != ',')
+                                break;
+                            e++;
+                        }
+                    return out;
+                }();
+                if (!skip.empty())
+                    for (const auto* m : { &vm, &pm })
+                        for (const ShaderTexture& t : m->textures)
+                            if (std::find(skip.begin(), skip.end(), r(kFetchConsts + t.slot * 6 + 1) & 0x1FFFF000) != skip.end())
+                                return;
+            }
             vs_srvs[32] = g_vertex_ring.srv.Get();
 
             // ---- constants
@@ -1911,7 +1943,10 @@ float4 ps_text(BlitOut i) : SV_Target
                     g_device->CreateShaderResourceView(res.Get(), nullptr, &srv);
                     g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
                     char name[64];
-                    snprintf(name, sizeof(name), "draw_%04u.png", g_dump_draw);
+                    if (g_dump_every)
+                        snprintf(name, sizeof(name), "f%06llu_draw_%04u.png", (unsigned long long)g_dump_frame, g_dump_draw);
+                    else
+                        snprintf(name, sizeof(name), "draw_%04u.png", g_dump_draw);
                     if (srv)
                         save_srv(srv.Get(), 256, 144, name, 1024, 720);
                 }
@@ -2274,6 +2309,8 @@ float4 ps_text(BlitOut i) : SV_Target
             g_screenshot_interval = uint32_t(std::atoi(v));
         if (const char* v = std::getenv("TT2_GPU_DUMP_FRAME"); v && std::atoll(v) > 0)
             g_dump_frame = uint64_t(std::atoll(v));
+        if (const char* v = std::getenv("TT2_GPU_DUMP_EVERY"); v && std::atoll(v) > 0)
+            g_dump_every = uint64_t(std::atoll(v));
         if (const char* v = std::getenv("TT2_GPU_PICK"); v && std::strchr(v, ','))
         {
             g_pick_x = std::atoi(v);
@@ -2438,6 +2475,8 @@ float4 ps_text(BlitOut i) : SV_Target
                 g_resolved.count(frontbuffer_physical & 0x1FFFF000) ? "resolved" : "not resolved");
         if ((g_screenshot_interval && g_frame % g_screenshot_interval == 0) || g_frame == g_dump_frame)
             screenshot(back.Get());
+        if (g_frame == g_dump_frame && g_dump_every)
+            g_dump_frame += g_dump_every;
         g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
         g_swapchain->Present(0, g_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
     }

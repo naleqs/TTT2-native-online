@@ -55,11 +55,11 @@ Last updated: 2026-10-22, version 0.1.0.
   frame plays again gets the handle of the one already playing (same sound within 3 frames), any
   other is not started (`src/runtime/game/tt2_sound_rollback.cpp`). A sound only the corrected
   timeline has is not heard.
-- **A see-through yellow layer in fights** (around the health bars, and over the whole winner
-  screen). It comes from the glow (bloom) post-process: its bright pass (glow draw 3 of 4) weighs
-  the scene by its colour, its alpha and a depth texture (a float depth resolve, read as
-  `k_24_8_FLOAT`), and one of these inputs is wrong in the renderer, so the glow covers more than
-  it should. Some of the glow chain's intermediate targets also show stale EDRAM data.
+- **Blue lines and patches next to the fighters** (thin streaks or a see-through band, about one
+  frame in ten). They are not in the 3D scene: they appear in the final post-processing composite,
+  which blends the scene with glow, depth of field and a frame-to-frame (motion blur) texture.
+  Ruled out: vertex data range, primitive restart, memory export, the glow pass.
+- **Heavenly Garden** has major graphical problems (not investigated yet).
 - **Small float differences between the two games** (positions up to a few units apart, health and
   round results identical), also in lockstep: the same match on two PCs is not bit-identical.
 - **Occasional crash in controller-slot code** (`sub_8241ABC0`/`sub_82420C40`, a slot pointer of
@@ -135,6 +135,9 @@ every other boot on a fast PC.
 | `TT2_FIGHT_CHECK=1` | Log the fighters' health and positions every second, and every re-run frame that ends differently from its first run (`TT2_FIGHT_LOG_ALL=1`: every frame, to compare two players' logs) |
 | `TT2_STRESS_ALTER=1` | Stress test: re-run frames with other inputs for player 1 (the fight must react) |
 | `TT2_READ_WATCH=hex` | Hardware watchpoint: log every function that reads or writes those 4 bytes |
+| `TT2_GPU_SKIP_TEX=hex,...` | Leave out every draw that samples one of these texture addresses (to see what a pass contributes) |
+| `TT2_GPU_DUMP_EVERY=n` | With `TT2_GPU_DUMP_FRAME`: dump again every `n` frames (files named by frame) |
+| `TT2_EDRAM_SAME_FORMAT=0` | Carry EDRAM contents over between surfaces of different formats too (the old behaviour: a yellow layer in fights) |
 | `TT2_UPDATE_REPO=owner/name` | Launcher: check that GitHub repository's latest release instead of this project's (testing the update notice) |
 | `TT2_EXCLUDE=begin-end,...` | Rollback: more guest ranges that never roll back (experiments) |
 | `TT2_SCENE_STEP_GAME=0`, `TT2_GAME_WINS=0`, `TT2_SIDE_HEAP=0`, `TT2_SOUND_ROLLBACK=0` | Rollback: turn off re-running the scene update, the "a page that held game state stays game state" rule, the side heap, or the sound handling (testing) |
